@@ -418,6 +418,7 @@ class StraikerGuardrail(CustomGuardrail):
             in_memory_cache=InMemoryCache(max_size_in_memory=dedup_size, default_ttl=None)
         )
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._dedup_backend_resolved = False
 
         if self.coding_agent is not None and self.coding_agent.mode == "block" and latency != "strict":
             verbose_proxy_logger.warning(
@@ -750,17 +751,50 @@ class StraikerGuardrail(CustomGuardrail):
             )
         return tuple(coding_agent.truncate_event(event, config.max_event_bytes) for event in events)
 
+    def _attach_shared_dedup(self) -> None:
+        """Borrow the proxy's Redis once it exists, so workers dedup against each other.
+
+        Without it every uvicorn worker keeps its own view and the same event is scored
+        once per worker. Lazy because the guardrail is constructed before the proxy's
+        cache is; in-memory-only is a valid single-worker configuration.
+        """
+        if self._dedup_backend_resolved:
+            return
+        self._dedup_backend_resolved = True
+        try:
+            from litellm.proxy.proxy_server import user_api_key_cache
+        except ImportError:
+            return
+        redis_cache = getattr(user_api_key_cache, "redis_cache", None)
+        if redis_cache is None:
+            return
+        self.dedup_cache.attach_redis_cache(redis_cache)
+        verbose_proxy_logger.info(json.dumps({"event": "straiker.dedup_backend", "backend": "redis"}))
+
     async def _claim_event(
         self,
         config: StraikerCodingAgentConfig,
         session_id: str,
         event: StraikerHookEvent,
     ) -> StraikerHookEvent | None:
+        """Claim an event exactly once.
+
+        The local claim is synchronous so no await can interleave between the read and the
+        write. Across workers the claim is a Redis SETNX, which is atomic and costs one
+        round trip; a read-then-write would let two workers both see a miss and both post.
+        """
+        self._attach_shared_dedup()
         key = f"straiker:coding:{session_id}:{event.dedup_key()}"
-        if await self.dedup_cache.async_get_cache(key) is not None:
+        local = self.dedup_cache.in_memory_cache
+        if local.get_cache(key) is not None:
             return None
-        await self.dedup_cache.async_set_cache(key, True, ttl=config.dedup_ttl)
-        return event
+        local.set_cache(key, True, ttl=config.dedup_ttl)
+
+        redis_cache = self.dedup_cache.redis_cache
+        if redis_cache is None:
+            return event
+        claimed = await redis_cache.async_set_cache(key, True, ttl=config.dedup_ttl, nx=True)
+        return event if claimed else None
 
     async def _post_coding_event(
         self,

@@ -2095,3 +2095,56 @@ async def test_windsurf_style_anthropic_traffic_parses_under_the_claude_code_pro
     events = _posted_events(g)
     assert [e["hook_event_name"] for e in events] == ["PostToolUse"]
     assert g.async_handler.post.call_args.kwargs["headers"]["x-tool"] == "claude-code"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_turns_post_the_event_once():
+    """Eight identical turns racing in one worker still yield a single event."""
+    g = _make_coding_guardrail()
+    request_data = _cc_request(_tool_result_messages(tool_use_id="toolu_race"))
+
+    await asyncio.gather(
+        *(g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request") for _ in range(8))
+    )
+
+    assert [e["hook_event_name"] for e in _posted_events(g)] == ["PostToolUse"]
+
+
+@pytest.mark.asyncio
+async def test_redis_dedup_suppresses_an_event_another_worker_already_scored():
+    """Multi-worker proxies keep separate in-memory caches, so cross-worker dedup has to
+    consult the shared backend before claiming."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.caching.in_memory_cache import InMemoryCache
+
+    redis = MagicMock()
+    redis.async_set_cache = AsyncMock(return_value=None)  # SETNX lost: another worker holds it
+    g = _make_coding_guardrail()
+    g.dedup_cache = DualCache(in_memory_cache=InMemoryCache(max_size_in_memory=100), redis_cache=redis)
+    g._dedup_backend_resolved = True
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert g.async_handler.post.await_count == 0
+    assert redis.async_set_cache.await_args.kwargs["nx"] is True
+
+
+@pytest.mark.asyncio
+async def test_first_worker_to_see_an_event_writes_it_to_the_shared_backend():
+    from litellm.caching.dual_cache import DualCache
+    from litellm.caching.in_memory_cache import InMemoryCache
+
+    redis = MagicMock()
+    redis.async_set_cache = AsyncMock(return_value=True)  # SETNX won
+    g = _make_coding_guardrail()
+    g.dedup_cache = DualCache(in_memory_cache=InMemoryCache(max_size_in_memory=100), redis_cache=redis)
+    g._dedup_backend_resolved = True
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert [e["hook_event_name"] for e in _posted_events(g)] == ["PostToolUse"]
+    redis.async_set_cache.assert_awaited()
