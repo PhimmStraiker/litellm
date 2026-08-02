@@ -19,6 +19,8 @@ _OPTIONAL_INIT_FIELDS: Final = (
     "custom_headers",
     "metadata",
     "verbose",
+    "coding_agent",
+    "app_attribution",
 )
 
 

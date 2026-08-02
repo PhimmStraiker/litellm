@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .base import GuardrailConfigModel
 
 StraikerWebhookEventType = Literal["pre_call", "post_call"]
 StraikerWebhookStreamPhase = Literal["none", "assembled"]
 StraikerWebhookAction = Literal["NONE", "BLOCKED", "GUARDRAIL_INTERVENED"]
+StraikerHookEventName = Literal["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+StraikerCodingAgentEnabled = Literal["auto", "off", "force"]
+StraikerCodingAgentMode = Literal["monitor", "block"]
+StraikerAppAttribution = Literal["default", "model", "key_alias", "team_alias"]
 
 STRAIKER_WEBHOOK_SCHEMA_VERSION: Final = "1"
+STRAIKER_DETECT_PATH: Final = "/api/v1/detect"
+STRAIKER_CODING_TOOL_HEADER: Final = "claude-code"
 
 
 class StraikerWebhookStream(BaseModel):
@@ -88,6 +95,116 @@ class StraikerWebhookResponse(BaseModel):
     turn_id: str | None = Field(default=None, alias="turnId")
 
 
+class StraikerHookEvent(BaseModel):
+    """One reconstructed coding-agent hook event, shaped exactly as the native Claude
+    Code hook handler posts it so both paths score through the same backend pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hook_event_name: StraikerHookEventName
+    session_id: str
+    user_name: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    prompt: str | None = None
+    tool_name: str | None = None
+    tool_input: dict[str, object] | None = None
+    tool_response: str | None = None
+    tool_use_id: str | None = None
+    is_error: bool | None = None
+    mcp_server_name: str | None = None
+    mcp_tool_name: str | None = None
+    app_response: str | None = None
+    stop_reason: str | None = None
+
+    def dedup_key(self) -> str:
+        """The agentic loop resends the whole transcript on every call, so request-side
+        events would otherwise re-fire for the rest of the session."""
+        if self.hook_event_name == "PreToolUse":
+            return f"pre:{self.tool_use_id}"
+        if self.hook_event_name == "PostToolUse":
+            return f"post:{self.tool_use_id}"
+        if self.hook_event_name == "UserPromptSubmit":
+            return f"prompt:{hashlib.sha256((self.prompt or '').encode()).hexdigest()}"
+        return f"stop:{hashlib.sha256((self.app_response or '').encode()).hexdigest()}"
+
+
+class StraikerDetectResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    turn_id: str | None = None
+    score: float | None = None
+    score_category: str | None = None
+    severity: str | None = None
+    reason: str | None = None
+    action: str | None = None
+
+
+class StraikerCodingAgentConfig(BaseModel):
+    """Coding-agent path config. Claude Code traffic is routed to /api/v1/detect with
+    ``x-tool: claude-code`` instead of the webhook envelope, so it needs its own key:
+    the backend files an application under Coding Agents or Custom Agents based on the
+    traffic it receives, and one key serving both surfaces mixes them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StraikerCodingAgentEnabled = Field(
+        default="auto",
+        description=(
+            "'auto' routes requests detected as a coding agent down the hook-event path; "
+            "'force' routes every request; 'off' disables it."
+        ),
+    )
+    api_key: str | None = Field(
+        default=None,
+        description="Straiker detect key for the coding-agent application. Falls back to the guardrail api_key.",
+        json_schema_extra={"secret": True},
+    )
+    detect_path: str = Field(
+        default=STRAIKER_DETECT_PATH,
+        description="Path appended to api_base for hook events.",
+    )
+    mode: StraikerCodingAgentMode = Field(
+        default="monitor",
+        description="'monitor' scores and surfaces only; 'block' denies tool calls whose verdict is block.",
+    )
+    chatter_filter: bool = Field(
+        default=True,
+        description=(
+            "Drop Claude Code's zero-tool utility calls (title generation, suggestion mode, "
+            "conversation recap) before scoring. These carry scaffolding, not user intent."
+        ),
+    )
+    sign_payloads: bool = Field(
+        default=True,
+        description="Send X-Straiker-Webhook-Signature/-Timestamp (HMAC-SHA256 over '{timestamp}.{payload}').",
+    )
+    timeout: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Per-event HTTP timeout in seconds. Falls back to the guardrail timeout.",
+    )
+    default_user_name: str = Field(
+        default="litellm-coding",
+        description=(
+            "Identity used when the request carries no virtual-key user. Must be stable for a "
+            "session or the backend cannot pair a prompt with its tool calls."
+        ),
+    )
+    dedup_ttl: int = Field(
+        default=3600,
+        gt=0,
+        description="Seconds an emitted event is remembered, so a resent transcript is not rescored.",
+    )
+
+    @field_validator("detect_path")
+    @classmethod
+    def _reject_webhook_path(cls, value: str) -> str:
+        if value.rstrip("/").endswith("/webhook"):
+            raise ValueError("detect_path must be the /api/v1/detect coding-agent path, not the webhook path")
+        return value
+
+
 class StraikerGuardrailConfigModelOptionalParams(BaseModel):
     timeout: float | None = Field(
         default=5.0,
@@ -139,6 +256,22 @@ class StraikerGuardrailConfigModelOptionalParams(BaseModel):
     verbose: bool | None = Field(
         default=False,
         description="Log webhook request/response payloads and record action/turn_id in response hidden params.",
+    )
+    coding_agent: StraikerCodingAgentConfig | None = Field(
+        default=None,
+        description=(
+            "Coding-agent (Claude Code) support. When a request is detected as a coding agent, "
+            "its Claude Code hook events are reconstructed and scored individually instead of "
+            "sending the flattened webhook envelope."
+        ),
+    )
+    app_attribution: StraikerAppAttribution | None = Field(
+        default="default",
+        description=(
+            "How each request is attributed to an application in the Defend Console. 'default' "
+            "reports every request as default_app; 'model', 'key_alias' and 'team_alias' give each "
+            "one its own application. metadata.agent_id always wins when present."
+        ),
     )
 
 

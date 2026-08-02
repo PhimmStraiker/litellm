@@ -4,7 +4,7 @@ import asyncio
 import json
 import random
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Final, Literal, Mapping, NoReturn, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -12,6 +12,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_proxy_logger
 from litellm._version import version as litellm_version
+from litellm.caching.dual_cache import DualCache
 from litellm.exceptions import (
     BadRequestError,
     GuardrailRaisedException,
@@ -31,8 +32,13 @@ from litellm.llms.custom_httpx.http_handler import (
 )
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
+    STRAIKER_CODING_TOOL_HEADER,
     STRAIKER_WEBHOOK_SCHEMA_VERSION,
+    StraikerAppAttribution,
+    StraikerCodingAgentConfig,
+    StraikerDetectResponse,
     StraikerGuardrailConfigModel,
+    StraikerHookEvent,
     StraikerWebhookApplication,
     StraikerWebhookContent,
     StraikerWebhookContext,
@@ -44,6 +50,9 @@ from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
     StraikerWebhookUsage,
 )
 from litellm.types.utils import GenericGuardrailAPIInputs
+
+from . import coding_agent
+from .detect_client import AsyncPoster, DetectFailure, DetectOutcome, is_block, post_hook_event
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -268,6 +277,57 @@ def _is_streamed_request(request_data: dict) -> bool:
     return body.get("stream") is True
 
 
+def _typed_request(request_data: object) -> dict[str, object]:
+    """Proxy request data is a JSON body plus litellm's own string keys; the base hook
+    signature just cannot say so."""
+    return cast("dict[str, object]", request_data) if isinstance(request_data, dict) else {}
+
+
+def _typed_child(container: Mapping[str, object], key: str) -> dict[str, object]:
+    return _typed_request(container.get(key))
+
+
+def _typed_metadata(request_data: Mapping[str, object]) -> dict[str, object]:
+    return {**_typed_child(request_data, "metadata"), **_typed_child(request_data, "litellm_metadata")}
+
+
+def _request_user_agent(request_data: Mapping[str, object]) -> str | None:
+    headers = _typed_child(_typed_child(request_data, "proxy_server_request"), "headers")
+    return next(
+        (value for key, value in headers.items() if key.lower() == "user-agent" and isinstance(value, str)),
+        None,
+    )
+
+
+def _coding_agent_config(value: object) -> StraikerCodingAgentConfig | None:
+    if value is None or isinstance(value, StraikerCodingAgentConfig):
+        return value
+    return StraikerCodingAgentConfig.model_validate(value)
+
+
+def _response_text(inputs: GenericGuardrailAPIInputs) -> str | None:
+    texts = [text for text in (inputs.get("texts") or []) if text]
+    return "\n".join(texts) if texts else None
+
+
+def _verdict_summary(outcome: DetectOutcome) -> dict[str, object]:
+    if isinstance(outcome, DetectFailure):
+        return {"error": outcome.message}
+    return {
+        "turn_id": outcome.turn_id,
+        "score": outcome.score,
+        "score_category": outcome.score_category,
+        "severity": outcome.severity,
+        "action": outcome.action,
+    }
+
+
+def _block_reason(outcome: DetectOutcome) -> str:
+    if isinstance(outcome, StraikerDetectResponse) and outcome.reason:
+        return outcome.reason
+    return DEFAULT_BLOCK_MESSAGE
+
+
 class StraikerGuardrail(CustomGuardrail):
     @staticmethod
     def get_config_model() -> type[GuardrailConfigModel]:
@@ -295,7 +355,10 @@ class StraikerGuardrail(CustomGuardrail):
         custom_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
         verbose: bool = False,
+        coding_agent: StraikerCodingAgentConfig | dict[str, object] | None = None,
+        app_attribution: StraikerAppAttribution = "default",
         async_handler: httpx.AsyncClient | None = None,
+        dedup_cache: DualCache | None = None,
         **kwargs: object,
     ) -> None:
         if not api_key:
@@ -316,6 +379,8 @@ class StraikerGuardrail(CustomGuardrail):
         self.custom_headers = dict(custom_headers) if custom_headers else {}
         self.default_metadata = dict(metadata) if metadata else {}
         self.verbose = bool(verbose)
+        self.coding_agent = _coding_agent_config(coding_agent)
+        self.app_attribution = app_attribution
 
         self.streaming_end_of_stream_only = True
         self.streaming_buffer_until_moderated = True
@@ -323,6 +388,7 @@ class StraikerGuardrail(CustomGuardrail):
         self.async_handler = async_handler or get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
+        self.dedup_cache = dedup_cache or DualCache()
 
         kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
         super().__init__(**kwargs)
@@ -342,11 +408,25 @@ class StraikerGuardrail(CustomGuardrail):
             **extra,
         }
 
-    def _build_application(self, request_data: dict) -> StraikerWebhookApplication:
+    def _attributed_source(self, request_data: Mapping[str, object], model: str | None) -> str | None:
+        """Give each application its own Console card instead of collapsing every request
+        the gateway proxies into one."""
+        meta: Final = _typed_metadata(request_data)
+        if self.app_attribution == "model":
+            return _as_optional_str(model) or _as_optional_str(request_data.get("model"))
+        if self.app_attribution == "key_alias":
+            return _as_optional_str(meta.get("user_api_key_alias"))
+        if self.app_attribution == "team_alias":
+            return _as_optional_str(meta.get("user_api_key_team_alias")) or _as_optional_str(
+                meta.get("user_api_key_team_id")
+            )
+        return None
+
+    def _build_application(self, request_data: dict, model: str | None = None) -> StraikerWebhookApplication:
         meta: Final = _merged_metadata(request_data)
         agent_id: Final = _as_optional_str(meta.get("agent_id"))
         return StraikerWebhookApplication(
-            source=agent_id or self.source,
+            source=agent_id or self._attributed_source(_typed_request(request_data), model) or self.source,
             name=_as_optional_str(meta.get("app_name")),
         )
 
@@ -395,7 +475,7 @@ class StraikerGuardrail(CustomGuardrail):
                 request=content,
                 context=self._build_context(request_data, model, logging_obj),
                 identity=_extract_identity(request_data),
-                application=self._build_application(request_data),
+                application=self._build_application(request_data, model),
                 metadata=_build_webhook_metadata(request_data, self.default_metadata),
             )
 
@@ -412,7 +492,7 @@ class StraikerGuardrail(CustomGuardrail):
             response=content,
             context=self._build_context(request_data, model, logging_obj),
             identity=_extract_identity(request_data),
-            application=self._build_application(request_data),
+            application=self._build_application(request_data, model),
             usage=_build_usage(response_obj),
             metadata=_build_webhook_metadata(request_data, self.default_metadata),
         )
@@ -564,6 +644,142 @@ class StraikerGuardrail(CustomGuardrail):
             return_inputs["texts"] = parsed.texts
         return return_inputs
 
+    def _routes_to_coding_agent(self, config: StraikerCodingAgentConfig, request_data: dict[str, object]) -> bool:
+        if config.enabled == "off":
+            return False
+        if config.enabled == "force":
+            return True
+        return coding_agent.is_claude_code(request_data, _request_user_agent(request_data))
+
+    def _coding_user_name(self, config: StraikerCodingAgentConfig, request_data: Mapping[str, object]) -> str:
+        """The backend keys a session's event trace on the user name, so an unstable value
+        splits one conversation into traces that never pair a prompt with its tool calls."""
+        meta = _typed_metadata(request_data)
+        return (
+            _as_optional_str(meta.get("user_api_key_user_email"))
+            or _as_optional_str(meta.get("user_api_key_user_id"))
+            or _as_optional_str(meta.get("user_api_key_alias"))
+            or config.default_user_name
+        )
+
+    def _coding_events(
+        self,
+        *,
+        config: StraikerCodingAgentConfig,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: Literal["request", "response"],
+        session_id: str,
+    ) -> tuple[StraikerHookEvent, ...]:
+        user_name = self._coding_user_name(config, request_data)
+        if input_type == "request":
+            parsed = coding_agent.parse_request(request_data, chatter_filter=config.chatter_filter)
+            return coding_agent.request_events(parsed, session_id, user_name)
+        if coding_agent.is_utility_call(request_data, config.chatter_filter):
+            return ()
+        return coding_agent.response_events(
+            coding_agent.parse_tool_calls(inputs.get("tool_calls")),
+            _response_text(inputs),
+            _response_finish_reason(request_data.get("response")),
+            session_id,
+            user_name,
+        )
+
+    async def _claim_event(
+        self,
+        config: StraikerCodingAgentConfig,
+        session_id: str,
+        event: StraikerHookEvent,
+    ) -> StraikerHookEvent | None:
+        key = f"straiker:coding:{session_id}:{event.dedup_key()}"
+        if await self.dedup_cache.async_get_cache(key) is not None:
+            return None
+        await self.dedup_cache.async_set_cache(key, True, ttl=config.dedup_ttl)
+        return event
+
+    async def _post_coding_event(
+        self,
+        config: StraikerCodingAgentConfig,
+        event: StraikerHookEvent,
+    ) -> DetectOutcome:
+        return await post_hook_event(
+            client=cast("AsyncPoster", self.async_handler),
+            url=f"{self.api_base}{config.detect_path}",
+            api_key=config.api_key or self.api_key,
+            x_tool=STRAIKER_CODING_TOOL_HEADER,
+            event=event,
+            sign=config.sign_payloads,
+            timeout=config.timeout or self.timeout,
+        )
+
+    def _log_coding_outcomes(
+        self,
+        events: tuple[StraikerHookEvent, ...],
+        outcomes: tuple[DetectOutcome, ...],
+    ) -> None:
+        for event, outcome in zip(events, outcomes):
+            record = {
+                "event": "straiker.coding_event",
+                "hook_event_name": event.hook_event_name,
+                "session_id": event.session_id,
+                "tool_name": event.tool_name,
+                "verdict": _verdict_summary(outcome),
+            }
+            if isinstance(outcome, DetectFailure):
+                verbose_proxy_logger.error(json.dumps(record, default=str))
+            elif self.verbose:
+                verbose_proxy_logger.info(json.dumps(record, default=str))
+
+    async def _apply_coding_agent(
+        self,
+        *,
+        config: StraikerCodingAgentConfig,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict[str, object],
+        input_type: Literal["request", "response"],
+    ) -> GenericGuardrailAPIInputs:
+        """Score a coding-agent call as the hook events it stands for.
+
+        Fail-open by contract: a session-less call, a parser error or an unreachable
+        detect endpoint passes the traffic through rather than breaking a developer's
+        session, matching the reference Kong implementation.
+        """
+        session_id = get_session_id_from_request_data(request_data)
+        if not session_id:
+            return inputs
+        try:
+            events = self._coding_events(
+                config=config,
+                inputs=inputs,
+                request_data=request_data,
+                input_type=input_type,
+                session_id=session_id,
+            )
+        except (AttributeError, KeyError, TypeError, ValidationError, ValueError) as error:
+            verbose_proxy_logger.warning(
+                json.dumps({"event": "straiker.coding_parse_error", "error": str(error)}, default=str)
+            )
+            return inputs
+
+        claimed = await asyncio.gather(*(self._claim_event(config, session_id, event) for event in events))
+        fresh = tuple(event for event in claimed if event is not None)
+        if not fresh:
+            return inputs
+
+        outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, event) for event in fresh)))
+        self._log_coding_outcomes(fresh, outcomes)
+
+        if config.mode != "block":
+            return inputs
+        blocked = next((outcome for outcome in outcomes if is_block(outcome)), None)
+        if blocked is None:
+            return inputs
+        self._block(
+            request_data=request_data,
+            input_type=input_type,
+            message=_block_reason(blocked),
+        )
+
     @log_guardrail_information
     async def apply_guardrail(
         self,
@@ -572,6 +788,15 @@ class StraikerGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj: LiteLLMLoggingObj | None = None,
     ) -> GenericGuardrailAPIInputs:
+        config = self.coding_agent
+        coding_request = _typed_request(request_data)
+        if config is not None and self._routes_to_coding_agent(config, coding_request):
+            return await self._apply_coding_agent(
+                config=config,
+                inputs=inputs,
+                request_data=coding_request,
+                input_type=input_type,
+            )
         try:
             envelope: Final = self._build_envelope(
                 inputs=inputs,
