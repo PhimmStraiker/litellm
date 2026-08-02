@@ -10,14 +10,32 @@ from .base import GuardrailConfigModel
 StraikerWebhookEventType = Literal["pre_call", "post_call"]
 StraikerWebhookStreamPhase = Literal["none", "assembled"]
 StraikerWebhookAction = Literal["NONE", "BLOCKED", "GUARDRAIL_INTERVENED"]
-StraikerHookEventName = Literal["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+StraikerHookEventName = Literal[
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "beforeSubmitPrompt",
+    "beforeShellExecution",
+    "beforeMCPExecution",
+    "beforeReadFile",
+    "postToolUse",
+]
 StraikerCodingAgentEnabled = Literal["auto", "off", "force"]
 StraikerCodingAgentMode = Literal["monitor", "block"]
+StraikerCodingAgentLatency = Literal["zero", "hold", "strict"]
+StraikerCodingAgentKind = Literal["claude_code", "cursor", "codex"]
 StraikerAppAttribution = Literal["default", "model", "key_alias", "team_alias"]
 
 STRAIKER_WEBHOOK_SCHEMA_VERSION: Final = "1"
 STRAIKER_DETECT_PATH: Final = "/api/v1/detect"
 STRAIKER_CODING_TOOL_HEADER: Final = "claude-code"
+STRAIKER_CURSOR_TOOL_HEADER: Final = "cursor"
+TRUNCATION_MARKER: Final = "…[truncated by Straiker gateway]"
+
+PROMPT_EVENTS: Final = frozenset({"UserPromptSubmit", "beforeSubmitPrompt"})
+TOOL_EVENTS: Final = frozenset({"PreToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile"})
+RESULT_EVENTS: Final = frozenset({"PostToolUse", "postToolUse"})
 
 
 class StraikerWebhookStream(BaseModel):
@@ -116,16 +134,17 @@ class StraikerHookEvent(BaseModel):
     mcp_tool_name: str | None = None
     app_response: str | None = None
     stop_reason: str | None = None
+    attachments: int | None = None
 
     def dedup_key(self) -> str:
         """The agentic loop resends the whole transcript on every call, so request-side
         events would otherwise re-fire for the rest of the session."""
-        if self.hook_event_name == "PreToolUse":
-            return f"pre:{self.tool_use_id}"
-        if self.hook_event_name == "PostToolUse":
-            return f"post:{self.tool_use_id}"
-        if self.hook_event_name == "UserPromptSubmit":
+        if self.hook_event_name in PROMPT_EVENTS:
             return f"prompt:{hashlib.sha256((self.prompt or '').encode()).hexdigest()}"
+        if self.hook_event_name in TOOL_EVENTS:
+            return f"pre:{self.tool_use_id}"
+        if self.hook_event_name in RESULT_EVENTS:
+            return f"post:{self.tool_use_id}"
         return f"stop:{hashlib.sha256((self.app_response or '').encode()).hexdigest()}"
 
 
@@ -196,6 +215,53 @@ class StraikerCodingAgentConfig(BaseModel):
         gt=0,
         description="Seconds an emitted event is remembered, so a resent transcript is not rescored.",
     )
+    dedup_cache_size: int = Field(
+        default=20000,
+        gt=0,
+        description=(
+            "In-memory dedup entries. LiteLLM's default cache holds 200, which a busy gateway "
+            "evicts in minutes; once a key is evicted the resent transcript is scored again."
+        ),
+    )
+    latency: StraikerCodingAgentLatency | None = Field(
+        default=None,
+        description=(
+            "Latency/assurance profile. 'zero': events are posted in the background and the "
+            "response streams untouched, so time-to-first-token is unaffected; nothing can be "
+            "blocked. 'hold': the response streams while the guardrail scores in flight and can "
+            "cut the stream, which stops further output but does NOT stop a tool call -- by the "
+            "time the verdict lands the tool_use has already reached the client, which runs it. "
+            "'strict': the response is withheld until scored, the only profile that can stop a "
+            "tool call before the agent executes it. Defaults to 'zero' when mode is monitor and "
+            "'strict' when mode is block."
+        ),
+    )
+    streaming_sampling_rate: int = Field(
+        default=5,
+        gt=0,
+        description="With latency 'hold', score every Nth streamed chunk.",
+    )
+    max_event_bytes: int = Field(
+        default=262144,
+        gt=0,
+        description=(
+            "Cap on one serialized hook event. Oversized tool output and prompts are truncated "
+            "with a marker rather than dropped. Deliberately far below max_payload_bytes: a hook "
+            "event is a single prompt or tool result, so an unbounded one is a whole file."
+        ),
+    )
+    agents: list[StraikerCodingAgentKind] = Field(
+        default=["claude_code", "cursor"],
+        description=(
+            "Which coding agents to reconstruct events for. 'codex' is off by default: the "
+            "Straiker backend has no x-tool value for it, so enabling it requires x_tool_override "
+            "and mislabels the traffic until the backend adds one."
+        ),
+    )
+    x_tool_override: str | None = Field(
+        default=None,
+        description="Force the x-tool routing header instead of deriving it from the detected agent.",
+    )
 
     @field_validator("detect_path")
     @classmethod
@@ -203,6 +269,16 @@ class StraikerCodingAgentConfig(BaseModel):
         if value.rstrip("/").endswith("/webhook"):
             raise ValueError("detect_path must be the /api/v1/detect coding-agent path, not the webhook path")
         return value
+
+    def resolved_latency(self) -> StraikerCodingAgentLatency:
+        if self.latency is not None:
+            return self.latency
+        return "strict" if self.mode == "block" else "zero"
+
+    def posts_in_background(self) -> bool:
+        """Only 'zero' can post without waiting: the other profiles need the verdict before
+        deciding whether the client may proceed."""
+        return self.resolved_latency() == "zero"
 
 
 class StraikerGuardrailConfigModelOptionalParams(BaseModel):

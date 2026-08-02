@@ -13,6 +13,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from litellm._logging import verbose_proxy_logger
 from litellm._version import version as litellm_version
 from litellm.caching.dual_cache import DualCache
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.exceptions import (
     BadRequestError,
     GuardrailRaisedException,
@@ -32,10 +33,10 @@ from litellm.llms.custom_httpx.http_handler import (
 )
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
-    STRAIKER_CODING_TOOL_HEADER,
     STRAIKER_WEBHOOK_SCHEMA_VERSION,
     StraikerAppAttribution,
     StraikerCodingAgentConfig,
+    StraikerCodingAgentKind,
     StraikerDetectResponse,
     StraikerGuardrailConfigModel,
     StraikerHookEvent,
@@ -322,6 +323,18 @@ def _verdict_summary(outcome: DetectOutcome) -> dict[str, object]:
     }
 
 
+def _event_preview(event: StraikerHookEvent) -> dict[str, object]:
+    """What was actually sent, abbreviated. Operators debugging a coding-agent app need to
+    see the tool command or the tool output that was scored, not just its verdict."""
+    body = event.model_dump(exclude_none=True)
+    preview = {
+        key: (value[:200] + "…" if isinstance(value, str) and len(value) > 200 else value)
+        for key, value in body.items()
+        if key in ("prompt", "tool_input", "tool_response", "app_response", "is_error", "attachments")
+    }
+    return {**preview, "bytes": len(event.model_dump_json(exclude_none=True).encode("utf-8"))}
+
+
 def _block_reason(outcome: DetectOutcome) -> str:
     if isinstance(outcome, StraikerDetectResponse) and outcome.reason:
         return outcome.reason
@@ -382,13 +395,58 @@ class StraikerGuardrail(CustomGuardrail):
         self.coding_agent = _coding_agent_config(coding_agent)
         self.app_attribution = app_attribution
 
-        self.streaming_end_of_stream_only = True
-        self.streaming_buffer_until_moderated = True
+        # Streaming posture. LiteLLM reads these off the instance when it wraps the
+        # stream, so they set the profile for this guardrail entry: buffering withholds
+        # every chunk until the assembled response is scored (safest, worst
+        # time-to-first-token), end-of-stream-only scores once at the end, and neither
+        # scores in flight at a sampled cadence so tokens keep flowing while a block can
+        # still stop the stream. A proxy that wants different postures for coding and
+        # non-coding traffic registers two guardrail entries and tag-routes them.
+        latency = self.coding_agent.resolved_latency() if self.coding_agent else "strict"
+        self.streaming_buffer_until_moderated = latency == "strict"
+        self.streaming_end_of_stream_only = latency != "hold"
+        if self.coding_agent is not None:
+            self.streaming_sampling_rate = self.coding_agent.streaming_sampling_rate
 
         self.async_handler = async_handler or get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
-        self.dedup_cache = dedup_cache or DualCache()
+        # LiteLLM's default in-memory cache holds 200 entries, which a busy gateway evicts
+        # in minutes; an evicted dedup key means the resent transcript is scored again.
+        dedup_size = self.coding_agent.dedup_cache_size if self.coding_agent else 20000
+        self.dedup_cache = dedup_cache or DualCache(
+            in_memory_cache=InMemoryCache(max_size_in_memory=dedup_size, default_ttl=None)
+        )
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+        if self.coding_agent is not None and self.coding_agent.mode == "block" and latency != "strict":
+            verbose_proxy_logger.warning(
+                json.dumps(
+                    {
+                        "event": "straiker.coding_enforcement_limited",
+                        "latency": latency,
+                        "detail": (
+                            "mode=block cannot stop a tool call at this latency profile: the "
+                            "tool_use reaches the client before the verdict does. Use "
+                            "latency=strict for tool-call enforcement."
+                        ),
+                    }
+                )
+            )
+        if self.coding_agent is not None:
+            verbose_proxy_logger.info(
+                json.dumps(
+                    {
+                        "event": "straiker.coding_agent_ready",
+                        "agents": list(self.coding_agent.agents),
+                        "mode": self.coding_agent.mode,
+                        "latency": latency,
+                        "posts_in_background": self.coding_agent.posts_in_background(),
+                        "streaming_buffer_until_moderated": self.streaming_buffer_until_moderated,
+                        "note": "streaming posture applies to all traffic on this guardrail entry",
+                    }
+                )
+            )
 
         kwargs.setdefault("supported_event_hooks", list(self.get_supported_event_hooks()))
         super().__init__(**kwargs)
@@ -644,12 +702,15 @@ class StraikerGuardrail(CustomGuardrail):
             return_inputs["texts"] = parsed.texts
         return return_inputs
 
-    def _routes_to_coding_agent(self, config: StraikerCodingAgentConfig, request_data: dict[str, object]) -> bool:
+    def _detect_coding_agent(
+        self, config: StraikerCodingAgentConfig, request_data: dict[str, object]
+    ) -> StraikerCodingAgentKind | None:
         if config.enabled == "off":
-            return False
-        if config.enabled == "force":
-            return True
-        return coding_agent.is_claude_code(request_data, _request_user_agent(request_data))
+            return None
+        agent = coding_agent.detect_agent(request_data, _request_user_agent(request_data), config.agents)
+        if agent is not None:
+            return agent
+        return "claude_code" if config.enabled == "force" else None
 
     def _coding_user_name(self, config: StraikerCodingAgentConfig, request_data: Mapping[str, object]) -> str:
         """The backend keys a session's event trace on the user name, so an unstable value
@@ -670,20 +731,24 @@ class StraikerGuardrail(CustomGuardrail):
         request_data: dict[str, object],
         input_type: Literal["request", "response"],
         session_id: str,
+        agent: StraikerCodingAgentKind,
     ) -> tuple[StraikerHookEvent, ...]:
         user_name = self._coding_user_name(config, request_data)
         if input_type == "request":
             parsed = coding_agent.parse_request(request_data, chatter_filter=config.chatter_filter)
-            return coding_agent.request_events(parsed, session_id, user_name)
-        if coding_agent.is_utility_call(request_data, config.chatter_filter):
-            return ()
-        return coding_agent.response_events(
-            coding_agent.parse_tool_calls(inputs.get("tool_calls")),
-            _response_text(inputs),
-            _response_finish_reason(request_data.get("response")),
-            session_id,
-            user_name,
-        )
+            events = coding_agent.request_events(parsed, session_id, user_name, agent)
+        elif coding_agent.is_utility_call(request_data, config.chatter_filter):
+            events = ()
+        else:
+            events = coding_agent.response_events(
+                coding_agent.parse_tool_calls(inputs.get("tool_calls")),
+                _response_text(inputs),
+                _response_finish_reason(request_data.get("response")),
+                session_id,
+                user_name,
+                agent,
+            )
+        return tuple(coding_agent.truncate_event(event, config.max_event_bytes) for event in events)
 
     async def _claim_event(
         self,
@@ -701,12 +766,13 @@ class StraikerGuardrail(CustomGuardrail):
         self,
         config: StraikerCodingAgentConfig,
         event: StraikerHookEvent,
+        agent: StraikerCodingAgentKind,
     ) -> DetectOutcome:
         return await post_hook_event(
             client=cast("AsyncPoster", self.async_handler),
             url=f"{self.api_base}{config.detect_path}",
             api_key=config.api_key or self.api_key,
-            x_tool=STRAIKER_CODING_TOOL_HEADER,
+            x_tool=config.x_tool_override or coding_agent.x_tool_for(agent),
             event=event,
             sign=config.sign_payloads,
             timeout=config.timeout or self.timeout,
@@ -724,11 +790,29 @@ class StraikerGuardrail(CustomGuardrail):
                 "session_id": event.session_id,
                 "tool_name": event.tool_name,
                 "verdict": _verdict_summary(outcome),
+                **({"content": _event_preview(event)} if self.verbose else {}),
             }
             if isinstance(outcome, DetectFailure):
                 verbose_proxy_logger.error(json.dumps(record, default=str))
             elif self.verbose:
                 verbose_proxy_logger.info(json.dumps(record, default=str))
+
+    def _dispatch_background(
+        self, config: StraikerCodingAgentConfig, events: tuple[StraikerHookEvent, ...], agent: StraikerCodingAgentKind
+    ) -> None:
+        """Post without waiting, so scoring never sits in front of the model call.
+
+        Delivery is best effort by construction: nothing can be blocked on a verdict that
+        has not arrived, which is the trade the 'zero' profile exists to make.
+        """
+
+        async def deliver() -> None:
+            outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, e, agent) for e in events)))
+            self._log_coding_outcomes(events, outcomes)
+
+        task = asyncio.create_task(deliver())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _apply_coding_agent(
         self,
@@ -737,6 +821,7 @@ class StraikerGuardrail(CustomGuardrail):
         inputs: GenericGuardrailAPIInputs,
         request_data: dict[str, object],
         input_type: Literal["request", "response"],
+        agent: StraikerCodingAgentKind,
     ) -> GenericGuardrailAPIInputs:
         """Score a coding-agent call as the hook events it stands for.
 
@@ -754,6 +839,7 @@ class StraikerGuardrail(CustomGuardrail):
                 request_data=request_data,
                 input_type=input_type,
                 session_id=session_id,
+                agent=agent,
             )
         except (AttributeError, KeyError, TypeError, ValidationError, ValueError) as error:
             verbose_proxy_logger.warning(
@@ -766,7 +852,11 @@ class StraikerGuardrail(CustomGuardrail):
         if not fresh:
             return inputs
 
-        outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, event) for event in fresh)))
+        if config.posts_in_background():
+            self._dispatch_background(config, fresh, agent)
+            return inputs
+
+        outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, event, agent) for event in fresh)))
         self._log_coding_outcomes(fresh, outcomes)
 
         if config.mode != "block":
@@ -790,12 +880,14 @@ class StraikerGuardrail(CustomGuardrail):
     ) -> GenericGuardrailAPIInputs:
         config = self.coding_agent
         coding_request = _typed_request(request_data)
-        if config is not None and self._routes_to_coding_agent(config, coding_request):
+        agent = self._detect_coding_agent(config, coding_request) if config is not None else None
+        if config is not None and agent is not None:
             return await self._apply_coding_agent(
                 config=config,
                 inputs=inputs,
                 request_data=coding_request,
                 input_type=input_type,
+                agent=agent,
             )
         try:
             envelope: Final = self._build_envelope(

@@ -19,7 +19,14 @@ from typing import Literal, Mapping, Sequence, cast
 
 from pydantic import BaseModel
 
-from litellm.types.proxy.guardrails.guardrail_hooks.straiker import StraikerHookEvent
+from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
+    STRAIKER_CODING_TOOL_HEADER,
+    STRAIKER_CURSOR_TOOL_HEADER,
+    TRUNCATION_MARKER,
+    StraikerCodingAgentKind as AgentKind,
+    StraikerHookEvent,
+    StraikerHookEventName,
+)
 
 SCAFFOLD_PATTERN = re.compile(
     r"<(system-reminder|command-message|command-name|command-args"
@@ -32,6 +39,14 @@ SYSTEM_REMINDER_PREFIX = "<system-reminder>"
 CLAUDE_CODE_CORE_TOOLS = frozenset({"Bash", "Read", "Edit", "TodoWrite"})
 
 CLAUDE_CODE_USER_AGENT_PREFIX = "claude-cli/"
+
+CURSOR_USER_AGENT_PREFIXES = ("Cursor/", "cursor/")
+
+CODEX_USER_AGENT_PREFIX = "codex_"
+
+CURSOR_SHELL_TOOLS = frozenset({"run_terminal_cmd", "Bash", "shell", "terminal"})
+
+CURSOR_READ_TOOLS = frozenset({"read_file", "Read", "list_dir", "file_search", "grep_search"})
 
 CLAUDE_CODE_SYSTEM_MARKERS = ("cc_version=", "cc_entrypoint=", "claude code")
 
@@ -73,6 +88,7 @@ class ParsedRequest:
     tool_results: tuple[ToolResult, ...]
     tool_count: int
     chatter_reason: str | None
+    attachments: int = 0
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -110,6 +126,45 @@ def _text_blocks(content: object) -> tuple[str, ...]:
     )
 
 
+def _human_bytes(size: int) -> str:
+    return f"{size / 1024:.0f}KB" if size >= 1024 else f"{size}B"
+
+
+def _image_marker(block: Mapping[str, object]) -> str:
+    """Images cannot be scored by the coding pipeline, but they must not vanish either:
+    a Read of a screenshot would otherwise produce an empty tool result that reads as a bug."""
+    source = _as_mapping(block.get("source"))
+    media_type = _as_str(source.get("media_type")) or _as_str(block.get("mime_type")) or "image"
+    data = source.get("data")
+    if isinstance(data, str) and data:
+        return f"[image: {media_type}, {_human_bytes(len(data) * 3 // 4)}]"
+    url = _as_str(source.get("url")) or _as_str(block.get("image_url"))
+    return f"[image: {media_type}, {url}]" if url else f"[image: {media_type}]"
+
+
+def _content_parts(content: object) -> tuple[str, ...]:
+    """Text verbatim, images as markers, in the order the model sees them."""
+    return tuple(
+        text
+        for block in _as_sequence(content)
+        for mapping in (_as_mapping(block),)
+        for text in (
+            (
+                _as_str(mapping.get("text"))
+                if mapping.get("type") == "text"
+                else _image_marker(mapping)
+                if mapping.get("type") in ("image", "image_url")
+                else None
+            ),
+        )
+        if text
+    )
+
+
+def count_images(content: object) -> int:
+    return sum(1 for block in _as_sequence(content) if _as_mapping(block).get("type") in ("image", "image_url"))
+
+
 def _system_text(system: object) -> str:
     if isinstance(system, str):
         return system
@@ -139,6 +194,31 @@ def is_claude_code(request_data: Mapping[str, object], user_agent: str | None) -
         return True
     system = _system_text(request_data.get("system")).lower()
     return any(marker in system for marker in CLAUDE_CODE_SYSTEM_MARKERS)
+
+
+def detect_agent(
+    request_data: Mapping[str, object],
+    user_agent: str | None,
+    enabled: Sequence[str],
+) -> AgentKind | None:
+    """Identify which coding agent produced this call, restricted to the enabled set.
+
+    Order matters: Cursor and Codex advertise themselves in the user agent, while Claude
+    Code is also inferred from its tool set, so the specific clients are checked first.
+    """
+    agent = user_agent or ""
+    if "cursor" in enabled and agent.startswith(CURSOR_USER_AGENT_PREFIXES):
+        return "cursor"
+    if "codex" in enabled and agent.startswith(CODEX_USER_AGENT_PREFIX):
+        return "codex"
+    if "claude_code" in enabled and is_claude_code(request_data, user_agent):
+        return "claude_code"
+    return None
+
+
+def x_tool_for(agent: AgentKind) -> str:
+    """Codex has no backend routing value; callers must supply x_tool_override for it."""
+    return STRAIKER_CURSOR_TOOL_HEADER if agent == "cursor" else STRAIKER_CODING_TOOL_HEADER
 
 
 def _tool_names_by_id(messages: Sequence[object]) -> Mapping[str, str]:
@@ -175,6 +255,63 @@ def _assistant_tool_uses(message: Mapping[str, object]) -> tuple[tuple[str, str]
     return tuple(pair for pair in pairs if pair is not None)
 
 
+def _responses_item(item: object) -> dict[str, object] | None:
+    """Map one Responses API input item onto the chat-message shape the parser reads.
+
+    Codex speaks `/v1/responses`, where a turn is a flat list of items rather than
+    messages: tool calls and their outputs are siblings of the user text. Normalizing here
+    keeps one parser instead of a second per-surface one.
+    """
+    mapping = _as_mapping(item)
+    item_type = mapping.get("type")
+    if item_type == "function_call":
+        call_id = _as_str(mapping.get("call_id")) or _as_str(mapping.get("id"))
+        name = _as_str(mapping.get("name"))
+        if not call_id or not name:
+            return None
+        return {
+            "role": "assistant",
+            "tool_calls": [{"id": call_id, "function": {"name": name, "arguments": mapping.get("arguments")}}],
+        }
+    if item_type == "function_call_output":
+        call_id = _as_str(mapping.get("call_id"))
+        if not call_id:
+            return None
+        return {"role": "tool", "tool_call_id": call_id, "content": mapping.get("output")}
+    role = _as_str(mapping.get("role"))
+    if not role:
+        return None
+    content = mapping.get("content")
+    if isinstance(content, str):
+        return {"role": role, "content": content}
+    blocks = tuple(
+        {"type": "text", "text": text}
+        for block in _as_sequence(content)
+        for block_mapping in (_as_mapping(block),)
+        if block_mapping.get("type") in ("input_text", "output_text", "text")
+        and (text := _as_str(block_mapping.get("text")))
+    )
+    images = tuple(
+        {"type": "image", "source": {"url": _as_str(block_mapping.get("image_url")) or ""}}
+        for block in _as_sequence(content)
+        for block_mapping in (_as_mapping(block),)
+        if block_mapping.get("type") in ("input_image", "image_url")
+    )
+    return {"role": role, "content": list(blocks + images)}
+
+
+def normalized_messages(request_data: Mapping[str, object]) -> Sequence[object]:
+    """The transcript, whichever surface produced it."""
+    messages = request_data.get("messages")
+    if isinstance(messages, (list, tuple)) and messages:
+        return _as_sequence(messages)
+    raw_input = request_data.get("input")
+    if isinstance(raw_input, str) and raw_input:
+        return ({"role": "user", "content": raw_input},)
+    converted = (_responses_item(item) for item in _as_sequence(raw_input))
+    return tuple(item for item in converted if item is not None)
+
+
 def _tail_after_last_assistant(messages: Sequence[object]) -> Sequence[object]:
     last_assistant = max(
         (index for index, message in enumerate(messages) if _as_mapping(message).get("role") == "assistant"),
@@ -186,7 +323,7 @@ def _tail_after_last_assistant(messages: Sequence[object]) -> Sequence[object]:
 def _block_text(content: object) -> str:
     if isinstance(content, str):
         return content
-    return "\n".join(_text_blocks(content))
+    return "\n".join(_content_parts(content))
 
 
 def _tool_results(tail: Sequence[object], names: Mapping[str, str]) -> tuple[ToolResult, ...]:
@@ -249,7 +386,7 @@ def parse_request(request_data: Mapping[str, object], chatter_filter: bool = Tru
     answers is recoverable from the same transcript, which is what lets PostToolUse carry
     a tool name.
     """
-    messages = _as_sequence(request_data.get("messages"))
+    messages = normalized_messages(request_data)
     tail = _tail_after_last_assistant(messages)
     prompt = _user_prompt(tail)
     tool_count = len(_tool_names(request_data))
@@ -260,6 +397,9 @@ def parse_request(request_data: Mapping[str, object], chatter_filter: bool = Tru
         tool_results=_tool_results(tail, _tool_names_by_id(messages)),
         tool_count=tool_count,
         chatter_reason=reason,
+        attachments=sum(
+            count_images(_as_mapping(m).get("content")) for m in tail if _as_mapping(m).get("role") == "user"
+        ),
     )
 
 
@@ -272,7 +412,7 @@ def is_utility_call(request_data: Mapping[str, object], chatter_filter: bool = T
     """
     if not chatter_filter:
         return False
-    tail = _tail_after_last_assistant(_as_sequence(request_data.get("messages")))
+    tail = _tail_after_last_assistant(normalized_messages(request_data))
     return _chatter_reason(len(_tool_names(request_data)), _user_prompt(tail)) is not None
 
 
@@ -325,10 +465,35 @@ def _mcp_fields(tool_name: str) -> tuple[str | None, str | None]:
     return match.group(1), match.group(2)
 
 
-def request_events(parsed: ParsedRequest, session_id: str, user_name: str | None) -> tuple[StraikerHookEvent, ...]:
-    post_tool_use = tuple(
+def _prompt_event_name(agent: AgentKind) -> StraikerHookEventName:
+    return "beforeSubmitPrompt" if agent == "cursor" else "UserPromptSubmit"
+
+
+def _result_event_name(agent: AgentKind) -> StraikerHookEventName:
+    return "postToolUse" if agent == "cursor" else "PostToolUse"
+
+
+def _tool_event_name(agent: AgentKind, tool_name: str) -> StraikerHookEventName:
+    """Cursor splits the single PreToolUse hook into three by tool class, and the backend
+    keys on those names, so a Cursor event must use the matching one."""
+    if agent != "cursor":
+        return "PreToolUse"
+    if tool_name.startswith("mcp__"):
+        return "beforeMCPExecution"
+    if tool_name in CURSOR_READ_TOOLS:
+        return "beforeReadFile"
+    return "beforeShellExecution"
+
+
+def request_events(
+    parsed: ParsedRequest,
+    session_id: str,
+    user_name: str | None,
+    agent: AgentKind = "claude_code",
+) -> tuple[StraikerHookEvent, ...]:
+    tool_results = tuple(
         StraikerHookEvent(
-            hook_event_name="PostToolUse",
+            hook_event_name=_result_event_name(agent),
             session_id=session_id,
             user_name=user_name,
             tool_name=result.tool_name,
@@ -339,13 +504,14 @@ def request_events(parsed: ParsedRequest, session_id: str, user_name: str | None
         for result in parsed.tool_results
     )
     if parsed.kind != "turn" or not parsed.user_prompt:
-        return post_tool_use
-    return post_tool_use + (
+        return tool_results
+    return tool_results + (
         StraikerHookEvent(
-            hook_event_name="UserPromptSubmit",
+            hook_event_name=_prompt_event_name(agent),
             session_id=session_id,
             user_name=user_name,
             prompt=parsed.user_prompt,
+            attachments=parsed.attachments or None,
         ),
     )
 
@@ -356,15 +522,16 @@ def response_events(
     finish_reason: str | None,
     session_id: str,
     user_name: str | None,
+    agent: AgentKind = "claude_code",
 ) -> tuple[StraikerHookEvent, ...]:
-    """PreToolUse for every tool the model wants to run, then Stop for a final answer.
+    """A tool event for every tool the model wants to run, then Stop for a final answer.
 
     Stop has no native equivalent: the endpoint hook never sees the model's answer, but a
     gateway does, so it is emitted for telemetry and output-side scoring only.
     """
-    pre_tool_use = tuple(
+    tool_events = tuple(
         StraikerHookEvent(
-            hook_event_name="PreToolUse",
+            hook_event_name=_tool_event_name(agent, call.tool_name),
             session_id=session_id,
             user_name=user_name,
             tool_name=call.tool_name,
@@ -377,8 +544,8 @@ def response_events(
         for mcp_server, mcp_tool in (_mcp_fields(call.tool_name),)
     )
     if tool_calls or not final_text:
-        return pre_tool_use
-    return pre_tool_use + (
+        return tool_events
+    return tool_events + (
         StraikerHookEvent(
             hook_event_name="Stop",
             session_id=session_id,
@@ -387,3 +554,34 @@ def response_events(
             stop_reason=finish_reason,
         ),
     )
+
+
+def _clip(text: str, budget: int) -> str:
+    return text if len(text) <= budget else text[:budget] + TRUNCATION_MARKER
+
+
+def truncate_event(event: StraikerHookEvent, max_bytes: int) -> StraikerHookEvent:
+    """Keep one event under the transport cap.
+
+    A coding agent can hand back an arbitrarily large tool result (a whole file, a full
+    test log), and posting it verbatim is how a gateway falls over. Clipping with a marker
+    keeps the event scoreable and shows the console the content was cut.
+    """
+    if len(event.model_dump_json(exclude_none=True).encode("utf-8")) <= max_bytes:
+        return event
+    overhead = 512
+    budget = max(256, max_bytes - overhead)
+    return event.model_copy(
+        update={
+            "tool_response": _clip(event.tool_response, budget) if event.tool_response else event.tool_response,
+            "prompt": _clip(event.prompt, budget) if event.prompt else event.prompt,
+            "app_response": _clip(event.app_response, budget) if event.app_response else event.app_response,
+            "tool_input": _clipped_tool_input(event.tool_input, budget),
+        }
+    )
+
+
+def _clipped_tool_input(tool_input: dict[str, object] | None, budget: int) -> dict[str, object] | None:
+    if not tool_input:
+        return tool_input
+    return {key: _clip(value, budget) if isinstance(value, str) else value for key, value in tool_input.items()}
