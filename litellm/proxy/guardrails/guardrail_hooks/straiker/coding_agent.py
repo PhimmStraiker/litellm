@@ -96,12 +96,12 @@ def _as_mapping(value: object) -> Mapping[str, object]:
     assembles them into; which one depends on the API surface and whether the response
     streamed, so both have to read the same."""
     if isinstance(value, BaseModel):
-        return cast("Mapping[str, object]", value.model_dump())
-    return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else {}
+        return cast("Mapping[str, object]", value.model_dump())  # cast-ok: model_dump of a JSON body is str-keyed
+    return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else {}  # cast-ok: decoded JSON object
 
 
 def _as_sequence(value: object) -> Sequence[object]:
-    return cast("Sequence[object]", value) if isinstance(value, (list, tuple)) else ()
+    return cast("Sequence[object]", value) if isinstance(value, (list, tuple)) else ()  # cast-ok: decoded JSON array
 
 
 def _as_str(value: object) -> str | None:
@@ -432,7 +432,7 @@ def _tool_arguments(function: Mapping[str, object]) -> dict[str, object]:
 
 def _decode_json(text: str) -> object | None:
     try:
-        return cast("object", json.loads(text))
+        return cast("object", json.loads(text))  # cast-ok: json.loads is Any; narrowed by the caller
     except json.JSONDecodeError:
         return None
 

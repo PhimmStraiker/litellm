@@ -282,7 +282,9 @@ def _is_streamed_request(request_data: dict) -> bool:
 def _typed_request(request_data: object) -> dict[str, object]:
     """Proxy request data is a JSON body plus litellm's own string keys; the base hook
     signature just cannot say so."""
-    return cast("dict[str, object]", request_data) if isinstance(request_data, dict) else {}
+    if not isinstance(request_data, dict):
+        return {}
+    return cast("dict[str, object]", request_data)  # cast-ok: proxy request data is str-keyed
 
 
 def _typed_child(container: Mapping[str, object], key: str) -> dict[str, object]:
@@ -831,7 +833,7 @@ class StraikerGuardrail(CustomGuardrail):
         agent: StraikerCodingAgentKind,
     ) -> DetectOutcome:
         return await post_hook_event(
-            client=cast("AsyncPoster", self.async_handler),
+            client=cast("AsyncPoster", self.async_handler),  # cast-ok: both client types satisfy the protocol
             url=f"{self.api_base}{config.detect_path}",
             api_key=config.api_key or self.api_key,
             x_tool=config.x_tool_override or coding_agent.x_tool_for(agent),
