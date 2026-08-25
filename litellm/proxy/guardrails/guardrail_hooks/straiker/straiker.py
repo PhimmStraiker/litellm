@@ -330,7 +330,7 @@ def _event_preview(event: StraikerHookEvent) -> dict[str, object]:
     preview = {
         key: (value[:200] + "…" if isinstance(value, str) and len(value) > 200 else value)
         for key, value in body.items()
-        if key in ("prompt", "tool_input", "tool_response", "app_response", "is_error", "attachments")
+        if key in ("prompt", "tool_input", "tool_response", "app_response", "is_error", "attachments", "user_name")
     }
     return {**preview, "bytes": len(event.model_dump_json(exclude_none=True).encode("utf-8"))}
 
