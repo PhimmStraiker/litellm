@@ -1189,11 +1189,11 @@ def _assembled_tool_call(
     return {"id": tool_use_id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
-def _make_coding_guardrail(**coding_overrides) -> StraikerGuardrail:
+def _make_coding_guardrail(_guardrail: dict | None = None, **coding_overrides) -> StraikerGuardrail:
     # latency "strict" keeps delivery awaited so a test can assert on what was posted;
     # the background ("zero") profile is covered explicitly further down.
     coding = {"enabled": "auto", "api_key": "coding-key", "mode": "monitor", "latency": "strict", **coding_overrides}
-    g = _make_guardrail(coding_agent=coding, event_hook=["pre_call", "post_call"])
+    g = _make_guardrail(coding_agent=coding, event_hook=["pre_call", "post_call"], **(_guardrail or {}))
     g.async_handler.post.return_value = _mock_detect()
     return g
 
@@ -2148,3 +2148,54 @@ async def test_first_worker_to_see_an_event_writes_it_to_the_shared_backend():
 
     assert [e["hook_event_name"] for e in _posted_events(g)] == ["PostToolUse"]
     redis.async_set_cache.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transient_transport_failure_is_retried_not_dropped():
+    """A live 33-session run lost 11 of 209 events to instant transport failures, because
+    the coding path had no retry while the webhook path did. A dropped event is a turn
+    missing from the console with nothing to show it went missing."""
+    g = _make_coding_guardrail(_guardrail={"max_retries": 2})
+    g.async_handler.post.side_effect = [
+        httpx.ConnectError("pool timeout"),
+        _mock_detect(),
+    ]
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert g.async_handler.post.await_count == 2  # first attempt failed, second succeeded
+    assert [e["hook_event_name"] for e in _posted_events(g)] == [
+        "PostToolUse",
+        "PostToolUse",
+    ]  # same event, both attempts
+
+
+@pytest.mark.asyncio
+async def test_retryable_status_is_retried_but_a_hard_error_is_not():
+    g = _make_coding_guardrail(_guardrail={"max_retries": 2})
+    bad = MagicMock(spec=httpx.Response)
+    bad.status_code = 400
+    bad.text = "malformed"
+    g.async_handler.post.side_effect = [bad]
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert g.async_handler.post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retries_are_bounded():
+    g = _make_coding_guardrail(_guardrail={"max_retries": 2})
+    g.async_handler.post.side_effect = httpx.ConnectError("down")
+    inputs = {"texts": []}
+
+    result = await g.apply_guardrail(
+        inputs=inputs, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert g.async_handler.post.await_count == g.max_retries + 1
+    assert result is inputs

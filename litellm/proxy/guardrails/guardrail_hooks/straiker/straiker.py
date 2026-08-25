@@ -810,6 +810,9 @@ class StraikerGuardrail(CustomGuardrail):
             event=event,
             sign=config.sign_payloads,
             timeout=config.timeout or self.timeout,
+            max_retries=self.max_retries,
+            initial_backoff=self.initial_backoff,
+            max_backoff=self.max_backoff,
         )
 
     def _log_coding_outcomes(
