@@ -2266,3 +2266,98 @@ async def test_zero_latency_gives_up_request_side_enforcement_too():
     await asyncio.gather(*g._background_tasks)
 
     assert result is inputs
+
+
+@pytest.mark.asyncio
+async def test_identity_can_come_from_a_request_header():
+    """Deployments that front many developers with one key still need to tell them apart,
+    so identity falls back to a header before the configured default."""
+    g = _make_coding_guardrail()
+    request_data = _cc_request(_tool_result_messages())
+    request_data["proxy_server_request"] = {
+        "headers": {"user-agent": CC_USER_AGENT, "X-Straiker-User-Name": "dev@example.com"}
+    }
+
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+
+    assert _posted_events(g)[0]["user_name"] == "dev@example.com"
+
+
+@pytest.mark.asyncio
+async def test_virtual_key_identity_beats_the_header():
+    g = _make_coding_guardrail()
+    request_data = _cc_request(_tool_result_messages())
+    request_data["metadata"] = {**request_data.get("metadata", {}), "user_api_key_user_email": "key@example.com"}
+    request_data["proxy_server_request"] = {
+        "headers": {"user-agent": CC_USER_AGENT, "X-Straiker-User-Name": "header@example.com"}
+    }
+
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+
+    assert _posted_events(g)[0]["user_name"] == "key@example.com"
+
+
+@pytest.mark.asyncio
+async def test_events_carry_the_model_so_the_console_can_attribute_them():
+    g = _make_coding_guardrail()
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert _posted_events(g)[0]["model"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_model_override_wins_over_the_requested_model():
+    g = _make_coding_guardrail(model_override="claude-code")
+
+    await g.apply_guardrail(
+        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert _posted_events(g)[0]["model"] == "claude-code"
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_blocks_when_scoring_is_unavailable():
+    """The default trades coverage for availability; a deployment that cannot accept
+    unscored coding traffic needs the opposite."""
+    g = _make_coding_guardrail(fail_open=False)
+    g.async_handler.post.side_effect = httpx.ConnectError("down")
+
+    with pytest.raises(GuardrailRaisedException):
+        await g.apply_guardrail(
+            inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fail_open_is_the_default_and_lets_traffic_through():
+    g = _make_coding_guardrail()
+    g.async_handler.post.side_effect = httpx.ConnectError("down")
+    inputs = {"texts": []}
+
+    result = await g.apply_guardrail(
+        inputs=inputs, request_data=_cc_request(_tool_result_messages()), input_type="request"
+    )
+
+    assert result is inputs
+
+
+@pytest.mark.asyncio
+async def test_header_identity_wins_over_litellms_master_key_placeholder():
+    """Regression: master-key traffic carries user_api_key_user_id='default_user_id', which
+    is LiteLLM's proxy-admin placeholder rather than a person. Treating it as a real identity
+    meant an explicitly supplied header could never take effect and every developer behind a
+    master key collapsed into one identity."""
+    g = _make_coding_guardrail()
+    request_data = _cc_request(_tool_result_messages())
+    request_data["metadata"] = {**request_data.get("metadata", {}), "user_api_key_user_id": "default_user_id"}
+    request_data["proxy_server_request"] = {
+        "headers": {"user-agent": CC_USER_AGENT, "X-Straiker-User-Name": "chris@straiker.ai"}
+    }
+
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+
+    assert _posted_events(g)[0]["user_name"] == "chris@straiker.ai"

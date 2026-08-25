@@ -122,6 +122,8 @@ Caller identity is taken from LiteLLM's own key, team, and user records, so crea
 
 Set `app_attribution` to give each model, key alias, or team its own application instead of attributing everything to `default_app`.
 
+Where virtual keys are impractical, `coding_agent.user_name_header` names a request header to take identity from instead, defaulting to `X-Straiker-User-Name`. A virtual key's own user always wins; the header is consulted before falling back to `default_user_name`. LiteLLM's `default_user_id`, which is what master-key traffic carries, is treated as absent so it never masks a header. Session grouping needs nothing extra: LiteLLM already promotes any `x-<vendor>-session-id` request header, and the agent's own session metadata, into the session the events are keyed on.
+
 ### 6. Cover coding agents
 
 Claude Code and similar agents do not behave like chat. A single prompt fans out into several model calls, roughly a quarter of which are the agent's own scaffolding (title generation, suggestion mode, conversation recap) rather than anything a person typed. Scoring those as user input is what produces false positives, and the parts that actually carry risk, the tool call and the tool result coming back, are not visible in a flattened chat envelope at all.
@@ -183,7 +185,7 @@ These flags are read per guardrail entry rather than per request, so a proxy ser
 - `metadata` (default: `None`): Metadata applied to every call. Config values win on a key conflict
 - `verbose` (default: `false`): Include the full per-category detection envelope in block responses
 - `app_attribution` (default: `default`): How non-coding traffic is attributed. `default`, `model`, `key_alias`, or `team_alias`. A request carrying `agent_id` always wins
-- `coding_agent` (default: `None`): Coding-agent support. Sub-options are `enabled` (`auto`, `force`, `off`), `api_key`, `mode` (`monitor` or `block`), `latency` (`zero`, `hold`, `strict`), `chatter_filter`, `agents`, `max_event_bytes`, `dedup_ttl`, `dedup_cache_size`, `streaming_sampling_rate`, `sign_payloads`, and `default_user_name`
+- `coding_agent` (default: `None`): Coding-agent support. Sub-options are `enabled` (`auto`, `force`, `off`), `api_key`, `mode` (`monitor` or `block`), `latency` (`zero`, `hold`, `strict`), `fail_open`, `chatter_filter`, `agents`, `user_name_header`, `default_user_name`, `model_override`, `max_event_bytes`, `dedup_ttl`, `dedup_cache_size`, `streaming_sampling_rate`, and `sign_payloads`
 
 ## What Straiker receives
 

@@ -20,6 +20,7 @@ from litellm.exceptions import (
     ModifyResponseException,
     Timeout,
 )
+from litellm.proxy._types import SpecialProxyStrings
 from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     get_session_id_from_request_data,
@@ -292,6 +293,23 @@ def _typed_metadata(request_data: Mapping[str, object]) -> dict[str, object]:
     return {**_typed_child(request_data, "metadata"), **_typed_child(request_data, "litellm_metadata")}
 
 
+def _real_identity(value: object) -> str | None:
+    """LiteLLM's proxy-admin placeholder is not a person."""
+    identity = _as_optional_str(value)
+    return None if identity == SpecialProxyStrings.default_user_id.value else identity
+
+
+def _request_header(request_data: Mapping[str, object], name: str | None) -> str | None:
+    if not name:
+        return None
+    headers = _typed_child(_typed_child(request_data, "proxy_server_request"), "headers")
+    wanted = name.lower()
+    return next(
+        (value for key, value in headers.items() if key.lower() == wanted and isinstance(value, str) and value),
+        None,
+    )
+
+
 def _request_user_agent(request_data: Mapping[str, object]) -> str | None:
     headers = _typed_child(_typed_child(request_data, "proxy_server_request"), "headers")
     return next(
@@ -330,7 +348,8 @@ def _event_preview(event: StraikerHookEvent) -> dict[str, object]:
     preview = {
         key: (value[:200] + "…" if isinstance(value, str) and len(value) > 200 else value)
         for key, value in body.items()
-        if key in ("prompt", "tool_input", "tool_response", "app_response", "is_error", "attachments", "user_name")
+        if key
+        in ("prompt", "tool_input", "tool_response", "app_response", "is_error", "attachments", "user_name", "model")
     }
     return {**preview, "bytes": len(event.model_dump_json(exclude_none=True).encode("utf-8"))}
 
@@ -715,12 +734,19 @@ class StraikerGuardrail(CustomGuardrail):
 
     def _coding_user_name(self, config: StraikerCodingAgentConfig, request_data: Mapping[str, object]) -> str:
         """The backend keys a session's event trace on the user name, so an unstable value
-        splits one conversation into traces that never pair a prompt with its tool calls."""
+        splits one conversation into traces that never pair a prompt with its tool calls.
+
+        ``default_user_id`` is LiteLLM's placeholder for the proxy master key rather than a
+        real person, so it must not outrank an explicitly supplied header; otherwise every
+        developer behind a master key collapses into one identity with no way to override.
+        """
         meta = _typed_metadata(request_data)
         return (
-            _as_optional_str(meta.get("user_api_key_user_email"))
+            _real_identity(meta.get("user_api_key_user_email"))
+            or _real_identity(meta.get("user_api_key_user_id"))
+            or _real_identity(meta.get("user_api_key_alias"))
+            or _request_header(request_data, config.user_name_header)
             or _as_optional_str(meta.get("user_api_key_user_id"))
-            or _as_optional_str(meta.get("user_api_key_alias"))
             or config.default_user_name
         )
 
@@ -735,9 +761,10 @@ class StraikerGuardrail(CustomGuardrail):
         agent: StraikerCodingAgentKind,
     ) -> tuple[StraikerHookEvent, ...]:
         user_name = self._coding_user_name(config, request_data)
+        model = config.model_override or _as_optional_str(request_data.get("model"))
         if input_type == "request":
             parsed = coding_agent.parse_request(request_data, chatter_filter=config.chatter_filter)
-            events = coding_agent.request_events(parsed, session_id, user_name, agent)
+            events = coding_agent.request_events(parsed, session_id, user_name, agent, model)
         elif coding_agent.is_utility_call(request_data, config.chatter_filter):
             events = ()
         else:
@@ -748,6 +775,7 @@ class StraikerGuardrail(CustomGuardrail):
                 session_id,
                 user_name,
                 agent,
+                model,
             )
         return tuple(coding_agent.truncate_event(event, config.max_event_bytes) for event in events)
 
@@ -895,6 +923,15 @@ class StraikerGuardrail(CustomGuardrail):
 
         outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, event, agent) for event in fresh)))
         self._log_coding_outcomes(fresh, outcomes)
+
+        if not config.fail_open:
+            failure = next((outcome for outcome in outcomes if isinstance(outcome, DetectFailure)), None)
+            if failure is not None:
+                self._block(
+                    request_data=request_data,
+                    input_type=input_type,
+                    message=f"Straiker detection unavailable: {failure.message}",
+                )
 
         if config.mode != "block":
             return inputs

@@ -490,12 +490,14 @@ def request_events(
     session_id: str,
     user_name: str | None,
     agent: AgentKind = "claude_code",
+    model: str | None = None,
 ) -> tuple[StraikerHookEvent, ...]:
     tool_results = tuple(
         StraikerHookEvent(
             hook_event_name=_result_event_name(agent),
             session_id=session_id,
             user_name=user_name,
+            model=model,
             tool_name=result.tool_name,
             tool_use_id=result.tool_use_id,
             tool_response=result.content,
@@ -510,6 +512,7 @@ def request_events(
             hook_event_name=_prompt_event_name(agent),
             session_id=session_id,
             user_name=user_name,
+            model=model,
             prompt=parsed.user_prompt,
             attachments=parsed.attachments or None,
         ),
@@ -523,6 +526,7 @@ def response_events(
     session_id: str,
     user_name: str | None,
     agent: AgentKind = "claude_code",
+    model: str | None = None,
 ) -> tuple[StraikerHookEvent, ...]:
     """A tool event for every tool the model wants to run, then Stop for a final answer.
 
@@ -534,6 +538,7 @@ def response_events(
             hook_event_name=_tool_event_name(agent, call.tool_name),
             session_id=session_id,
             user_name=user_name,
+            model=model,
             tool_name=call.tool_name,
             tool_use_id=call.tool_use_id,
             tool_input=call.tool_input,
@@ -550,6 +555,7 @@ def response_events(
             hook_event_name="Stop",
             session_id=session_id,
             user_name=user_name,
+            model=model,
             app_response=final_text,
             stop_reason=finish_reason,
         ),

@@ -203,6 +203,25 @@ class StraikerCodingAgentConfig(BaseModel):
         gt=0.0,
         description="Per-event HTTP timeout in seconds. Falls back to the guardrail timeout.",
     )
+    user_name_header: str | None = Field(
+        default="X-Straiker-User-Name",
+        description=(
+            "Request header carrying the caller's identity, used when the virtual key has no "
+            "user. Set to null to ignore it. A session's event trace is keyed on this, so a "
+            "deployment without per-developer virtual keys needs it to tell developers apart."
+        ),
+    )
+    model_override: str | None = Field(
+        default=None,
+        description="Force the model reported on each event instead of the model the request named.",
+    )
+    fail_open: bool = Field(
+        default=True,
+        description=(
+            "Whether traffic proceeds when scoring fails. False blocks the request instead, "
+            "which trades developer availability for guaranteed coverage."
+        ),
+    )
     default_user_name: str = Field(
         default="litellm-coding",
         description=(
