@@ -1,12 +1,14 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
+from litellm._logging import verbose_proxy_logger
 from litellm.exceptions import GuardrailRaisedException, ModifyResponseException
 from litellm.proxy.guardrails.guardrail_hooks.straiker import coding_agent, initialize_guardrail
 from litellm.proxy.guardrails.guardrail_hooks.straiker.straiker import (
@@ -2479,3 +2481,126 @@ def test_nested_config_secrets_are_masked_not_returned_verbatim():
     assert "****" in masked["provider_block"]["api_key"]
     assert masked["provider_block"]["enabled"] == "auto"
     assert masked["default_app"] == "gateway"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_releases_its_claim_so_the_resent_transcript_retries():
+    """The claim is taken before the post, so holding it after a failure meant the event was
+    never retried: the agent resends the transcript, the key is already held, and the turn is
+    lost for good."""
+    g = _make_coding_guardrail(_guardrail={"max_retries": 0})
+    request_data = _cc_request(_tool_result_messages())
+    g.async_handler.post.side_effect = httpx.ConnectError("down")
+
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+    assert g.async_handler.post.await_count == 1
+
+    g.async_handler.post.side_effect = None
+    g.async_handler.post.return_value = _mock_detect()
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+
+    assert [e["hook_event_name"] for e in _posted_events(g)] == ["PostToolUse", "PostToolUse"]
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_event_keeps_its_claim():
+    g = _make_coding_guardrail()
+    request_data = _cc_request(_tool_result_messages())
+
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+    await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
+
+    assert g.async_handler.post.await_count == 1
+
+
+def test_fail_closed_at_zero_latency_warns_because_it_cannot_be_honoured():
+    """Nothing is waited for at this profile, so fail_open=false would silently do nothing."""
+    with mock.patch.object(verbose_proxy_logger, "warning") as warn:
+        _make_guardrail(
+            coding_agent={"enabled": "auto", "api_key": "k", "fail_open": False, "latency": "zero"}
+        )
+
+    assert any("coding_fail_closed_ignored" in str(c) for c in warn.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_force_mode_does_not_drop_tool_less_chat():
+    """Zero tools is a Claude Code signal, not a universal one. Treating it as scaffolding in
+    force mode dropped ordinary chat that simply had no tools."""
+    g = _make_coding_guardrail(enabled="force")
+
+    await g.apply_guardrail(
+        inputs={"texts": ["what is 2 + 2"]},
+        request_data={
+            "messages": [{"role": "user", "content": "what is 2 + 2"}],
+            "litellm_session_id": "sess-force-chat",
+            "proxy_server_request": {"headers": {"user-agent": "python-httpx/0.27"}},
+        },
+        input_type="request",
+    )
+
+    assert [e["hook_event_name"] for e in _posted_events(g)] == ["UserPromptSubmit"]
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_still_drops_the_agents_tool_less_scaffolding():
+    g = _make_coding_guardrail()
+    titlegen = _cc_request(
+        [{"role": "user", "content": [{"type": "text", "text": "write a 5-10 word title"}]}], tools=()
+    )
+
+    await g.apply_guardrail(inputs={"texts": ["x"]}, request_data=titlegen, input_type="request")
+
+    assert g.async_handler.post.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_is_not_emitted_for_a_mid_stream_chunk():
+    """At latency=hold the guardrail runs on sampled chunks, where text is present but the turn
+    has not ended. Emitting Stop there produced a stop event per chunk."""
+    g = _make_coding_guardrail(latency="hold")
+
+    await g.apply_guardrail(
+        inputs={"texts": ["partial answer so far"]},
+        request_data={**_cc_request(_first_turn_messages()), "response": {"choices": [{"finish_reason": None}]}},
+        input_type="response",
+    )
+
+    assert g.async_handler.post.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_is_emitted_once_the_turn_actually_ends():
+    g = _make_coding_guardrail(latency="hold")
+
+    await g.apply_guardrail(
+        inputs={"texts": ["the finished answer"]},
+        request_data={**_cc_request(_first_turn_messages()), "response": {"choices": [{"finish_reason": "stop"}]}},
+        input_type="response",
+    )
+
+    assert [e["hook_event_name"] for e in _posted_events(g)] == ["Stop"]
+
+
+@pytest.mark.asyncio
+async def test_an_event_with_several_large_fields_is_shrunk_until_it_fits():
+    """Clipping each field to the cap once still leaves a payload over the cap when more than
+    one field is large."""
+    g = _make_coding_guardrail(max_event_bytes=4096)
+    huge = "A" * 50_000
+    tool_call = _assembled_tool_call(
+        "toolu_big",
+        "Bash",
+        json.dumps({"command": huge, "description": huge, "context": huge}),
+    )
+
+    await g.apply_guardrail(
+        inputs={"tool_calls": [tool_call]},
+        request_data={**_cc_request(_first_turn_messages()), "response": {"choices": [{"finish_reason": "tool_calls"}]}},
+        input_type="response",
+    )
+
+    events = _posted_events(g)
+    assert [e["hook_event_name"] for e in events] == ["PreToolUse"]
+    assert len(json.dumps(events[0]).encode("utf-8")) <= 4096
+    assert events[0]["tool_input"]["command"].endswith("[truncated by Straiker gateway]")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from urllib.parse import urlsplit
@@ -39,6 +39,7 @@ from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
     StraikerAppAttribution,
     StraikerCodingAgentConfig,
     StraikerCodingAgentKind,
+    StraikerCodingAgentLatency,
     StraikerDetectResponse,
     StraikerGuardrailConfigModel,
     StraikerHookEvent,
@@ -363,6 +364,26 @@ def _block_reason(outcome: DetectOutcome) -> str:
     return DEFAULT_BLOCK_MESSAGE
 
 
+def _coding_config_warnings(
+    config: StraikerCodingAgentConfig | None, latency: StraikerCodingAgentLatency
+) -> Iterator[tuple[str, str]]:
+    """Config combinations that are accepted but cannot do what their name promises."""
+    if config is None:
+        return
+    if not config.fail_open and latency == "zero":
+        yield (
+            "straiker.coding_fail_closed_ignored",
+            "coding_agent_fail_open=false has no effect at latency=zero, which posts in the "
+            "background and never waits for a verdict. Use latency=hold or strict.",
+        )
+    if config.mode == "block" and latency != "strict":
+        yield (
+            "straiker.coding_enforcement_limited",
+            "mode=block cannot stop a tool call at this latency profile: the tool_use reaches "
+            "the client before the verdict does. Use latency=strict for tool-call enforcement.",
+        )
+
+
 class StraikerGuardrail(CustomGuardrail):
     guardrail_provider: str = "straiker"
 
@@ -444,20 +465,8 @@ class StraikerGuardrail(CustomGuardrail):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._dedup_backend_resolved = False
 
-        if self.coding_agent is not None and self.coding_agent.mode == "block" and latency != "strict":
-            verbose_proxy_logger.warning(
-                json.dumps(
-                    {
-                        "event": "straiker.coding_enforcement_limited",
-                        "latency": latency,
-                        "detail": (
-                            "mode=block cannot stop a tool call at this latency profile: the "
-                            "tool_use reaches the client before the verdict does. Use "
-                            "latency=strict for tool-call enforcement."
-                        ),
-                    }
-                )
-            )
+        for event, detail in _coding_config_warnings(self.coding_agent, latency):
+            verbose_proxy_logger.warning(json.dumps({"event": event, "detail": detail, "latency": latency}))
         if self.coding_agent is not None:
             verbose_proxy_logger.info(
                 json.dumps(
@@ -768,9 +777,13 @@ class StraikerGuardrail(CustomGuardrail):
         user_name = self._coding_user_name(config, request_data)
         model = _as_optional_str(request_data.get("model"))
         if input_type == "request":
-            parsed = coding_agent.parse_request(request_data, chatter_filter=config.chatter_filter)
+            parsed = coding_agent.parse_request(
+                request_data,
+                chatter_filter=config.chatter_filter,
+                tool_less_is_utility=config.enabled != "force",
+            )
             events = coding_agent.request_events(parsed, session_id, user_name, agent, model)
-        elif coding_agent.is_utility_call(request_data, config.chatter_filter):
+        elif coding_agent.is_utility_call(request_data, config.chatter_filter, config.enabled != "force"):
             events = ()
         else:
             events = coding_agent.response_events(
@@ -829,6 +842,25 @@ class StraikerGuardrail(CustomGuardrail):
         claimed = await redis_cache.async_set_cache(key, True, ttl=config.dedup_ttl, nx=True)
         return event if claimed else None
 
+    async def _release_claim(self, session_id: str, event: StraikerHookEvent) -> None:
+        key: Final = f"straiker:coding:{session_id}:{event.dedup_key()}"
+        self.dedup_cache.in_memory_cache.delete_cache(key)
+        redis_cache = self.dedup_cache.redis_cache
+        if redis_cache is not None:
+            await redis_cache.async_delete_cache(key)
+
+    async def _release_failed_claims(
+        self,
+        session_id: str,
+        events: tuple[StraikerHookEvent, ...],
+        outcomes: tuple[DetectOutcome, ...],
+    ) -> None:
+        """A claim taken before the post means a failed post is never retried, because the
+        resent transcript finds the key already held."""
+        failed = tuple(e for e, o in zip(events, outcomes) if isinstance(o, DetectFailure))
+        if failed:
+            await asyncio.gather(*(self._release_claim(session_id, e) for e in failed))
+
     async def _post_coding_event(
         self,
         config: StraikerCodingAgentConfig,
@@ -868,7 +900,11 @@ class StraikerGuardrail(CustomGuardrail):
                 verbose_proxy_logger.info(json.dumps(record, default=str))
 
     def _dispatch_background(
-        self, config: StraikerCodingAgentConfig, events: tuple[StraikerHookEvent, ...], agent: StraikerCodingAgentKind
+        self,
+        config: StraikerCodingAgentConfig,
+        events: tuple[StraikerHookEvent, ...],
+        agent: StraikerCodingAgentKind,
+        session_id: str,
     ) -> None:
         """Post without waiting, so scoring never sits in front of the model call.
 
@@ -879,6 +915,7 @@ class StraikerGuardrail(CustomGuardrail):
         async def deliver() -> None:
             outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, e, agent) for e in events)))
             self._log_coding_outcomes(events, outcomes)
+            await self._release_failed_claims(session_id, events, outcomes)
 
         task = asyncio.create_task(deliver())
         self._background_tasks.add(task)
@@ -923,11 +960,12 @@ class StraikerGuardrail(CustomGuardrail):
             return inputs
 
         if config.posts_in_background():
-            self._dispatch_background(config, fresh, agent)
+            self._dispatch_background(config, fresh, agent, session_id)
             return inputs
 
         outcomes = tuple(await asyncio.gather(*(self._post_coding_event(config, event, agent) for event in fresh)))
         self._log_coding_outcomes(fresh, outcomes)
+        await self._release_failed_claims(session_id, fresh, outcomes)
 
         if not config.fail_open:
             failure = next((outcome for outcome in outcomes if isinstance(outcome, DetectFailure)), None)

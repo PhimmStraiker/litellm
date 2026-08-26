@@ -16,7 +16,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Final, Literal, cast
 
 from pydantic import BaseModel
 
@@ -380,14 +380,18 @@ def _user_prompt(tail: Sequence[object]) -> str | None:
     return candidates[-1].strip() if candidates else None
 
 
-def _chatter_reason(tool_count: int, prompt: str | None) -> str | None:
+def _chatter_reason(tool_count: int, prompt: str | None, tool_less_is_utility: bool) -> str | None:
     if tool_count == 0:
-        return "no_tools_utility"
+        return "no_tools_utility" if tool_less_is_utility else None
     haystack = (prompt or "").lower()
     return next((f"marker:{marker}" for marker in CHATTER_MARKERS if marker in haystack), None)
 
 
-def parse_request(request_data: Mapping[str, object], chatter_filter: bool = True) -> ParsedRequest:
+def parse_request(
+    request_data: Mapping[str, object],
+    chatter_filter: bool = True,
+    tool_less_is_utility: bool = True,
+) -> ParsedRequest:
     """Classify one model call and pull out the prompt and any tool results it carries.
 
     Claude Code resends the whole transcript every call, so the tool result the model is
@@ -399,7 +403,7 @@ def parse_request(request_data: Mapping[str, object], chatter_filter: bool = Tru
     tail = _tail_after_last_assistant(messages)
     prompt = _user_prompt(tail)
     tool_count = len(_tool_names(request_data))
-    reason = _chatter_reason(tool_count, prompt) if chatter_filter else None
+    reason: Final = _chatter_reason(tool_count, prompt, tool_less_is_utility) if chatter_filter else None
     return ParsedRequest(
         kind="utility" if reason else "turn",
         user_prompt=prompt,
@@ -412,7 +416,11 @@ def parse_request(request_data: Mapping[str, object], chatter_filter: bool = Tru
     )
 
 
-def is_utility_call(request_data: Mapping[str, object], chatter_filter: bool = True) -> bool:
+def is_utility_call(
+    request_data: Mapping[str, object],
+    chatter_filter: bool = True,
+    tool_less_is_utility: bool = True,
+) -> bool:
     """Whether this call is Claude Code scaffolding rather than user intent.
 
     The response side needs this too: a title-generation call produces a perfectly
@@ -422,7 +430,7 @@ def is_utility_call(request_data: Mapping[str, object], chatter_filter: bool = T
     if not chatter_filter:
         return False
     tail = _tail_after_last_assistant(normalized_messages(request_data))
-    return _chatter_reason(len(_tool_names(request_data)), _user_prompt(tail)) is not None
+    return _chatter_reason(len(_tool_names(request_data)), _user_prompt(tail), tool_less_is_utility) is not None
 
 
 def _tool_arguments(function: Mapping[str, object]) -> dict[str, object]:
@@ -557,7 +565,7 @@ def response_events(
         for call in tool_calls
         for mcp_server, mcp_tool in (_mcp_fields(call.tool_name),)
     )
-    if tool_calls or not final_text:
+    if tool_calls or not final_text or not finish_reason:
         return tool_events
     return tool_events + (
         StraikerHookEvent(
@@ -582,10 +590,17 @@ def truncate_event(event: StraikerHookEvent, max_bytes: int) -> StraikerHookEven
     test log), and posting it verbatim is how a gateway falls over. Clipping with a marker
     keeps the event scoreable and shows the console the content was cut.
     """
-    if len(event.model_dump_json(exclude_none=True).encode("utf-8")) <= max_bytes:
+    if _event_bytes(event) <= max_bytes:
         return event
-    overhead = 512
-    budget = max(256, max_bytes - overhead)
+    attempts: Final = (_clip_event(event, b) for b in _shrinking_budgets(max_bytes))
+    return next((c for c in attempts if _event_bytes(c) <= max_bytes), _clip_event(event, 256))
+
+
+def _shrinking_budgets(max_bytes: int) -> tuple[int, ...]:
+    return tuple(max(256, (max_bytes - 512) >> shift) for shift in range(6))
+
+
+def _clip_event(event: StraikerHookEvent, budget: int) -> StraikerHookEvent:
     return event.model_copy(
         update={
             "tool_response": _clip(event.tool_response, budget) if event.tool_response else event.tool_response,
@@ -594,6 +609,10 @@ def truncate_event(event: StraikerHookEvent, max_bytes: int) -> StraikerHookEven
             "tool_input": _clipped_tool_input(event.tool_input, budget),
         }
     )
+
+
+def _event_bytes(event: StraikerHookEvent) -> int:
+    return len(event.model_dump_json(exclude_none=True).encode("utf-8"))
 
 
 def _clipped_tool_input(tool_input: dict[str, object] | None, budget: int) -> dict[str, object] | None:
