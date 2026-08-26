@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Mapping, Sequence, cast
+from typing import Literal, cast
 
 from pydantic import BaseModel
 
@@ -23,9 +24,11 @@ from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
     STRAIKER_CODING_TOOL_HEADER,
     STRAIKER_CURSOR_TOOL_HEADER,
     TRUNCATION_MARKER,
-    StraikerCodingAgentKind as AgentKind,
     StraikerHookEvent,
     StraikerHookEventName,
+)
+from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
+    StraikerCodingAgentKind as AgentKind,
 )
 
 SCAFFOLD_PATTERN = re.compile(

@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Literal, Mapping, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -20,7 +21,6 @@ from litellm.exceptions import (
     ModifyResponseException,
     Timeout,
 )
-from litellm.proxy._types import SpecialProxyStrings
 from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     get_session_id_from_request_data,
@@ -32,6 +32,7 @@ from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
 )
+from litellm.proxy._types import SpecialProxyStrings
 from litellm.types.guardrails import GuardrailEventHooks, Mode
 from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
     STRAIKER_WEBHOOK_SCHEMA_VERSION,

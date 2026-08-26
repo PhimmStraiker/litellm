@@ -14,7 +14,7 @@ import json
 import random
 import time
 from dataclasses import dataclass
-from typing import Protocol, Union
+from typing import Protocol
 
 import httpx
 from pydantic import ValidationError
@@ -48,12 +48,12 @@ class DetectFailure:
     message: str
 
 
-DetectOutcome = Union[StraikerDetectResponse, DetectFailure]
+DetectOutcome = StraikerDetectResponse | DetectFailure
 
 
 def _signature_headers(api_key: str, payload: str) -> dict[str, str]:
     timestamp = str(int(time.time()))
-    digest = hmac.new(api_key.encode("utf-8"), f"{timestamp}.{payload}".encode("utf-8"), hashlib.sha256).hexdigest()
+    digest = hmac.new(api_key.encode("utf-8"), f"{timestamp}.{payload}".encode(), hashlib.sha256).hexdigest()
     return {"X-Straiker-Webhook-Signature": digest, "X-Straiker-Webhook-Timestamp": timestamp}
 
 
