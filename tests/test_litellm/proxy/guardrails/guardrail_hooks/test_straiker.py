@@ -95,7 +95,7 @@ def test_config_model_wiring():
 
 
 def test_init_rejects_empty_api_key():
-    with pytest.raises(ValueError, match='api_key must be non-empty'):
+    with pytest.raises(ValueError, match="api_key must be non-empty"):
         StraikerGuardrail(api_key="")
 
 
@@ -114,7 +114,7 @@ def test_supported_hooks_limited_to_pre_and_post():
 
 
 def test_during_call_mode_rejected_at_init():
-    with pytest.raises(ValueError, match='Event hook GuardrailEventHooks\\.during_call is not in the'):
+    with pytest.raises(ValueError, match="Event hook GuardrailEventHooks\\.during_call is not in the"):
         StraikerGuardrail(api_key="k", event_hook="during_call")
 
 
@@ -2516,9 +2516,7 @@ async def test_a_delivered_event_keeps_its_claim():
 def test_fail_closed_at_zero_latency_warns_because_it_cannot_be_honoured():
     """Nothing is waited for at this profile, so fail_open=false would silently do nothing."""
     with mock.patch.object(verbose_proxy_logger, "warning") as warn:
-        _make_guardrail(
-            coding_agent={"enabled": "auto", "api_key": "k", "fail_open": False, "latency": "zero"}
-        )
+        _make_guardrail(coding_agent={"enabled": "auto", "api_key": "k", "fail_open": False, "latency": "zero"})
 
     assert any("coding_fail_closed_ignored" in str(c) for c in warn.call_args_list)
 
@@ -2596,7 +2594,10 @@ async def test_an_event_with_several_large_fields_is_shrunk_until_it_fits():
 
     await g.apply_guardrail(
         inputs={"tool_calls": [tool_call]},
-        request_data={**_cc_request(_first_turn_messages()), "response": {"choices": [{"finish_reason": "tool_calls"}]}},
+        request_data={
+            **_cc_request(_first_turn_messages()),
+            "response": {"choices": [{"finish_reason": "tool_calls"}]},
+        },
         input_type="response",
     )
 
@@ -2604,3 +2605,30 @@ async def test_an_event_with_several_large_fields_is_shrunk_until_it_fits():
     assert [e["hook_event_name"] for e in events] == ["PreToolUse"]
     assert len(json.dumps(events[0]).encode("utf-8")) <= 4096
     assert events[0]["tool_input"]["command"].endswith("[truncated by Straiker gateway]")
+
+
+def test_nested_coding_agent_config_is_refused_rather_than_silently_ignored():
+    """The pre-flat nested shape must not boot with coding-agent scoring quietly switched off."""
+    from litellm.proxy.guardrails.guardrail_hooks.straiker import _coding_agent_settings
+    from litellm.types.guardrails import LitellmParams
+
+    params = LitellmParams(guardrail="straiker", mode="pre_call", api_key="k")
+    setattr(params, "coding_agent", {"enabled": "auto", "mode": "block", "latency": "strict"})
+
+    with pytest.raises(ValueError, match="nested `coding_agent:` config is not supported"):
+        _coding_agent_settings(params, getattr(params, "optional_params", None))
+
+
+def test_flat_coding_agent_config_is_still_read():
+    """The guard must not disturb the supported flat form."""
+    from litellm.proxy.guardrails.guardrail_hooks.straiker import _coding_agent_settings
+    from litellm.types.guardrails import LitellmParams
+
+    params = LitellmParams(guardrail="straiker", mode="pre_call", api_key="k")
+    setattr(params, "coding_agent_enabled", "auto")
+    setattr(params, "coding_agent_mode", "block")
+
+    assert _coding_agent_settings(params, getattr(params, "optional_params", None)) == {
+        "enabled": "auto",
+        "mode": "block",
+    }

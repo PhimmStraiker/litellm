@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
 import litellm
@@ -44,12 +45,29 @@ def _get_config_value(litellm_params: "LitellmParams", optional_params: object, 
     return getattr(litellm_params, attribute_name, None)
 
 
+def _reject_nested_coding_agent(litellm_params: "LitellmParams", optional_params: object) -> None:
+    """Refuse the pre-flat nested ``coding_agent:`` block instead of reading it as absent.
+
+    The flat keys are read by name, so a nested block matches nothing and leaves coding-agent
+    scoring switched off with no error. Booting without a security control is worse than not
+    booting, so this fails loudly and names the replacement.
+    """
+    if isinstance(_get_config_value(litellm_params, optional_params, "coding_agent"), Mapping):
+        raise ValueError(
+            "straiker: nested `coding_agent:` config is not supported. Use the flat "
+            "`coding_agent_*` keys instead (coding_agent_enabled, coding_agent_api_key, "
+            "coding_agent_mode, coding_agent_latency, ...). A nested block is read as absent, "
+            "which would leave coding-agent scoring silently disabled."
+        )
+
+
 def _coding_agent_settings(litellm_params: "LitellmParams", optional_params: object) -> dict[str, object] | None:
     """Assemble the coding-agent settings from flat ``coding_agent_*`` config.
 
     They are flat rather than nested so each one renders as its own control in the admin UI,
     and so a reader can see at a glance whether coding agents are on and which key they use.
     """
+    _reject_nested_coding_agent(litellm_params, optional_params)
     values = {
         field: value
         for field in _CODING_AGENT_FIELDS
