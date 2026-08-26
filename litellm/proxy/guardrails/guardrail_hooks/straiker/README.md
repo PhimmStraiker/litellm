@@ -122,13 +122,13 @@ Caller identity is taken from LiteLLM's own key, team, and user records, so crea
 
 Set `app_attribution` to give each model, key alias, or team its own application instead of attributing everything to `default_app`.
 
-Where virtual keys are impractical, `coding_agent.user_name_header` names a request header to take identity from instead, defaulting to `X-Straiker-User-Name`. A virtual key's own user always wins; the header is consulted before falling back to `default_user_name`. LiteLLM's `default_user_id`, which is what master-key traffic carries, is treated as absent so it never masks a header. Session grouping needs nothing extra: LiteLLM already promotes any `x-<vendor>-session-id` request header, and the agent's own session metadata, into the session the events are keyed on.
+Where virtual keys are impractical, `coding_agent_user_name_header` names a request header to take identity from instead, defaulting to `X-Straiker-User-Name`. A virtual key's own user always wins; the header is consulted before falling back to `default_user_name`. LiteLLM's `default_user_id`, which is what master-key traffic carries, is treated as absent so it never masks a header. Session grouping needs nothing extra: LiteLLM already promotes any `x-<vendor>-session-id` request header, and the agent's own session metadata, into the session the events are keyed on.
 
 ### 6. Cover coding agents
 
 Claude Code and similar agents do not behave like chat. A single prompt fans out into several model calls, roughly a quarter of which are the agent's own scaffolding (title generation, suggestion mode, conversation recap) rather than anything a person typed. Scoring those as user input is what produces false positives, and the parts that actually carry risk, the tool call and the tool result coming back, are not visible in a flattened chat envelope at all.
 
-Add a `coding_agent` block and a request detected as a coding agent is instead reconstructed into the hook events the agent's own endpoint hooks would emit, each scored individually. Everything else keeps using the standard path.
+Enable coding agents and a request detected as one is instead reconstructed into the hook events the agent's own endpoint hooks would emit, each scored individually. Everything else keeps using the standard path.
 
 ```yaml
 guardrails:
@@ -138,13 +138,14 @@ guardrails:
       mode: pre_call
       default_on: true
       api_key: os.environ/STRAIKER_API_KEY
-      coding_agent:
-        enabled: auto
-        api_key: os.environ/STRAIKER_CODING_KEY
-        mode: monitor
+      coding_agent_enabled: auto
+      coding_agent_api_key: os.environ/STRAIKER_CODING_KEY
+      coding_agent_mode: monitor
 ```
 
-Repeat the same `coding_agent` block on the `post_call` entry. Use a separate key: Straiker classifies an application by the traffic it receives, so one key serving both coding agents and ordinary gateway traffic mixes them into a single application.
+Repeat the same three settings on the `post_call` entry. They are also editable in the admin UI
+under the guardrail's provider configuration, where `coding_agent_enabled`, `coding_agent_mode`
+and `coding_agent_latency` render as dropdowns. Use a separate key: Straiker classifies an application by the traffic it receives, so one key serving both coding agents and ordinary gateway traffic mixes them into a single application.
 
 No routing change is needed. The client keeps one base URL and detection happens per request, from the user agent, the tool set, or the client's own system prompt markers.
 
@@ -152,7 +153,7 @@ A session produces one prompt event, one pre-tool and one post-tool event per to
 
 #### Latency profiles
 
-`coding_agent.latency` decides how much assurance to trade for time to first token. Measured against a live proxy on a streaming request, with a direct provider call at 1.13s as the baseline:
+`coding_agent_latency` decides how much assurance to trade for time to first token. Measured against a live proxy on a streaming request, with a direct provider call at 1.13s as the baseline:
 
 | `latency` | Time to first token | Streams | Blocks a prompt or a poisoned tool result | Blocks a tool call before it runs |
 |---|---|---|---|---|
@@ -185,7 +186,14 @@ These flags are read per guardrail entry rather than per request, so a proxy ser
 - `metadata` (default: `None`): Metadata applied to every call. Config values win on a key conflict
 - `verbose` (default: `false`): Include the full per-category detection envelope in block responses
 - `app_attribution` (default: `default`): How non-coding traffic is attributed. `default`, `model`, `key_alias`, or `team_alias`. A request carrying `agent_id` always wins
-- `coding_agent` (default: `None`): Coding-agent support. Sub-options are `enabled` (`auto`, `force`, `off`), `api_key`, `mode` (`monitor` or `block`), `latency` (`zero`, `hold`, `strict`), `fail_open`, `chatter_filter`, `agents`, `user_name_header`, `default_user_name`, `model_override`, `max_event_bytes`, `dedup_ttl`, `dedup_cache_size`, `streaming_sampling_rate`, and `sign_payloads`
+- `coding_agent_enabled` (default: `off`): `auto` scores a detected coding agent as hook events, `force` treats all traffic that way, `off` disables it
+- `coding_agent_api_key`: Straiker key for the coding-agent application. Required when enabled, and must differ from `api_key`
+- `coding_agent_mode` (default: `monitor`): `monitor` scores only, `block` denies on a block verdict
+- `coding_agent_latency` (default: by mode): `zero`, `hold`, or `strict`
+- `coding_agent_fail_open` (default: `true`): Whether coding-agent traffic proceeds when scoring is unavailable
+- `coding_agent_chatter_filter` (default: `true`): Drops the agent's scaffolding calls
+- `coding_agent_user_name_header` (default: `X-Straiker-User-Name`): Header to take developer identity from
+- `coding_agent_model_override`, `coding_agent_max_event_bytes`, `coding_agent_dedup_ttl`: advanced tuning
 
 ## What Straiker receives
 
@@ -216,7 +224,7 @@ On the coding-agent path the envelope above is not used. Each reconstructed even
 - `pre_call`
 - `post_call`
 
-`during_call` is not supported and is rejected at initialization. Streaming responses are covered by `post_call`: the stream is buffered, the assembled response is inspected, and it is released only after it clears. With a `coding_agent` block configured, `latency` decides whether that buffering happens at all.
+`during_call` is not supported and is rejected at initialization. Streaming responses are covered by `post_call`: the stream is buffered, the assembled response is inspected, and it is released only after it clears. With coding agents enabled, `coding_agent_latency` decides whether that buffering happens at all.
 
 ## Error handling
 

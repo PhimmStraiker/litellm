@@ -2409,3 +2409,64 @@ async def test_a_homegrown_agent_keeps_using_the_webhook_path_on_a_shared_proxy(
     assert call.args[0].endswith("/api/v1/detect/webhook")
     assert "x-tool" not in call.kwargs["headers"]
     assert json.loads(call.kwargs["content"])["application"]["source"] == "payments-agent"
+
+
+def test_coding_agent_is_configured_with_flat_fields_so_the_ui_can_render_them():
+    """Nested config renders as a single free-text box in the admin UI, which is not
+    configurable in practice. Flat fields give each option its own control."""
+    from litellm.types.guardrails import LitellmParams
+
+    params = LitellmParams(
+        guardrail="straiker",
+        mode="pre_call",
+        api_key="gw-key",
+        coding_agent_enabled="auto",
+        coding_agent_api_key="coding-key",
+        coding_agent_mode="block",
+    )
+    callback = initialize_guardrail(params, {"guardrail_name": "straiker"})
+
+    assert callback.coding_agent is not None
+    assert callback.coding_agent.enabled == "auto"
+    assert callback.coding_agent.api_key == "coding-key"
+    assert callback.coding_agent.resolved_latency() == "strict"
+
+
+def test_coding_agent_is_off_unless_explicitly_enabled():
+    from litellm.types.guardrails import LitellmParams
+
+    params = LitellmParams(guardrail="straiker", mode="pre_call", api_key="gw-key")
+
+    assert initialize_guardrail(params, {"guardrail_name": "straiker"}).coding_agent is None
+
+
+def test_enum_options_are_literals_so_the_ui_renders_dropdowns():
+    fields = StraikerGuardrailConfigModelOptionalParams.model_fields
+    for name in ("coding_agent_enabled", "coding_agent_mode", "coding_agent_latency"):
+        assert name in fields, name
+    assert "coding_agent" not in fields  # the nested shape is gone, not shipped alongside
+
+
+def test_the_coding_agent_key_is_marked_secret():
+    field = StraikerGuardrailConfigModelOptionalParams.model_fields["coding_agent_api_key"]
+    assert (field.json_schema_extra or {}).get("secret") is True
+
+
+def test_nested_config_secrets_are_masked_not_returned_verbatim():
+    """Regression: the masker only descended into a dict when the parent key itself looked
+    sensitive, so a secret under an innocuous key was returned in full by the guardrail list
+    endpoint."""
+    from litellm.litellm_core_utils.litellm_logging import _get_masked_values
+
+    masked = _get_masked_values(
+        {
+            "api_key": "c4ac433a-e798-416e-9add-f57a06453d18",
+            "default_app": "gateway",
+            "provider_block": {"enabled": "auto", "api_key": "4a36aade-3252-47b2-bda5-cde767cb7dbc"},
+        }
+    )
+
+    assert masked["provider_block"]["api_key"] != "4a36aade-3252-47b2-bda5-cde767cb7dbc"
+    assert "****" in masked["provider_block"]["api_key"]
+    assert masked["provider_block"]["enabled"] == "auto"
+    assert masked["default_app"] == "gateway"

@@ -352,13 +352,61 @@ class StraikerGuardrailConfigModelOptionalParams(BaseModel):
         default=False,
         description="Log webhook request/response payloads and record action/turn_id in response hidden params.",
     )
-    coding_agent: StraikerCodingAgentConfig | None = Field(
+    coding_agent_enabled: StraikerCodingAgentEnabled | None = Field(
+        default="off",
+        description=(
+            "Coding-agent support. 'auto' scores a detected coding agent as the hook events it "
+            "stands for instead of one flattened envelope; 'force' treats all traffic that way; "
+            "'off' disables it. Ordinary application traffic is unaffected either way."
+        ),
+    )
+    coding_agent_api_key: str | None = Field(
         default=None,
         description=(
-            "Coding-agent (Claude Code) support. When a request is detected as a coding agent, "
-            "its Claude Code hook events are reconstructed and scored individually instead of "
-            "sending the flattened webhook envelope."
+            "Straiker key for the coding-agent application. Required when coding agents are "
+            "enabled: Straiker files an application by the traffic it receives, so reusing the "
+            "gateway key would merge coding sessions into the gateway's application."
         ),
+        json_schema_extra={"secret": True},
+    )
+    coding_agent_mode: StraikerCodingAgentMode | None = Field(
+        default="monitor",
+        description="'monitor' scores and surfaces only; 'block' denies on a block verdict.",
+    )
+    coding_agent_latency: StraikerCodingAgentLatency | None = Field(
+        default=None,
+        description=(
+            "Assurance traded against time to first token. 'zero' posts in the background and "
+            "never blocks; 'hold' streams while scoring and blocks prompts and tool results; "
+            "'strict' withholds output until scored and is the only one that stops a tool call. "
+            "Defaults to 'zero' for monitor and 'strict' for block."
+        ),
+    )
+    coding_agent_fail_open: bool | None = Field(
+        default=True,
+        description="Whether coding-agent traffic proceeds when scoring is unavailable.",
+    )
+    coding_agent_chatter_filter: bool | None = Field(
+        default=True,
+        description="Drop the agent's own scaffolding calls, which are not user intent.",
+    )
+    coding_agent_user_name_header: str | None = Field(
+        default="X-Straiker-User-Name",
+        description="Request header to take developer identity from when a virtual key has no user.",
+    )
+    coding_agent_model_override: str | None = Field(
+        default=None,
+        description="Force the model reported on each coding-agent event.",
+    )
+    coding_agent_max_event_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        description="Cap on one hook event; oversized tool output is truncated with a marker.",
+    )
+    coding_agent_dedup_ttl: int | None = Field(
+        default=None,
+        gt=0,
+        description="Seconds an emitted coding-agent event is remembered so a resent transcript is not rescored.",
     )
     app_attribution: StraikerAppAttribution | None = Field(
         default="default",
