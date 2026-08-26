@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from litellm.exceptions import GuardrailRaisedException, ModifyResponseException
-from litellm.proxy.guardrails.guardrail_hooks.straiker import initialize_guardrail
+from litellm.proxy.guardrails.guardrail_hooks.straiker import coding_agent, initialize_guardrail
 from litellm.proxy.guardrails.guardrail_hooks.straiker.straiker import (
     StraikerGuardrail,
     _build_usage,
@@ -2361,3 +2361,51 @@ async def test_header_identity_wins_over_litellms_master_key_placeholder():
     await g.apply_guardrail(inputs={"texts": []}, request_data=request_data, input_type="request")
 
     assert _posted_events(g)[0]["user_name"] == "chris@straiker.ai"
+
+
+@pytest.mark.parametrize(
+    ("label", "tools", "expected_coding"),
+    [
+        ("claude code declares its whole tool set", ["Bash", "Read", "Edit", "TodoWrite", "Glob"], True),
+        ("three of four is still claude code", ["Bash", "Read", "Edit", "Glob"], True),
+        ("an app that merely exposes Read is not", ["Read", "search_docs"], False),
+        ("nor one with Read and Bash", ["Read", "Bash", "refund_order"], False),
+        ("nor an ordinary tool-using agent", ["search_docs", "refund_order"], False),
+    ],
+)
+def test_homegrown_agents_are_not_mistaken_for_a_coding_agent(label, tools, expected_coding):
+    """One proxy serves coding agents and ordinary applications at once, so the tool-set
+    signal has to be specific. Matching any single core tool name routed an application that
+    merely exposed a tool called Read onto the coding path and into the wrong console
+    application."""
+    request_data = {"tools": [{"name": name} for name in tools]}
+
+    agent = coding_agent.detect_agent(request_data, "python-httpx/0.27", ["claude_code", "cursor"])
+
+    assert (agent == "claude_code") is expected_coding
+
+
+@pytest.mark.asyncio
+async def test_a_homegrown_agent_keeps_using_the_webhook_path_on_a_shared_proxy():
+    """End to end on one guardrail: a coding agent and an ordinary application hit different
+    endpoints and therefore different console applications."""
+    g = _make_coding_guardrail()
+    g.async_handler.post.return_value = _mock_response("NONE")
+
+    await g.apply_guardrail(
+        inputs={"texts": ["refund order 12345"]},
+        request_data={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "refund order 12345"}],
+            "tools": [{"name": "Read"}, {"name": "refund_order"}],
+            "metadata": {"agent_id": "payments-agent"},
+            "proxy_server_request": {"headers": {"user-agent": "openai-python/1.40"}},
+        },
+        input_type="request",
+        logging_obj=_logging_obj(),
+    )
+
+    call = g.async_handler.post.call_args
+    assert call.args[0].endswith("/api/v1/detect/webhook")
+    assert "x-tool" not in call.kwargs["headers"]
+    assert json.loads(call.kwargs["content"])["application"]["source"] == "payments-agent"

@@ -38,6 +38,12 @@ SYSTEM_REMINDER_PREFIX = "<system-reminder>"
 
 CLAUDE_CODE_CORE_TOOLS = frozenset({"Bash", "Read", "Edit", "TodoWrite"})
 
+CLAUDE_CODE_MIN_CORE_TOOLS = 3
+"""Claude Code declares its whole tool set on every call, so all four core tools are always
+present even when the run restricts which may be used. Requiring most of them rather than any
+one keeps an ordinary application that happens to expose a tool named ``Read`` on the standard
+path."""
+
 CLAUDE_CODE_USER_AGENT_PREFIX = "claude-cli/"
 
 CURSOR_USER_AGENT_PREFIXES = ("Cursor/", "cursor/")
@@ -190,7 +196,7 @@ def is_claude_code(request_data: Mapping[str, object], user_agent: str | None) -
     """
     if user_agent and user_agent.startswith(CLAUDE_CODE_USER_AGENT_PREFIX):
         return True
-    if not CLAUDE_CODE_CORE_TOOLS.isdisjoint(_tool_names(request_data)):
+    if len(CLAUDE_CODE_CORE_TOOLS & set(_tool_names(request_data))) >= CLAUDE_CODE_MIN_CORE_TOOLS:
         return True
     system = _system_text(request_data.get("system")).lower()
     return any(marker in system for marker in CLAUDE_CODE_SYSTEM_MARKERS)
