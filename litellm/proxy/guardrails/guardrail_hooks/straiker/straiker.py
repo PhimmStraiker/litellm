@@ -363,6 +363,8 @@ def _block_reason(outcome: DetectOutcome) -> str:
 
 
 class StraikerGuardrail(CustomGuardrail):
+    guardrail_provider: str = "straiker"
+
     @staticmethod
     def get_config_model() -> type[GuardrailConfigModel]:
         return StraikerGuardrailConfigModel

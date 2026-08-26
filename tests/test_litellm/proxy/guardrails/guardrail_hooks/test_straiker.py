@@ -534,11 +534,14 @@ async def test_application_source_from_agent_id():
 async def test_request_block_raises_guardrail_exception_with_reason():
     g = _make_guardrail()
     g.async_handler.post.return_value = _mock_response("BLOCKED", blocked_reason="prompt injection")
+    request_data = {"model": "m"}
     with pytest.raises(GuardrailRaisedException) as exc:
         await g.apply_guardrail(
-            inputs={"texts": ["attack"]}, request_data={"model": "m"}, input_type="request", logging_obj=_logging_obj()
+            inputs={"texts": ["attack"]}, request_data=request_data, input_type="request", logging_obj=_logging_obj()
         )
     assert "prompt injection" in str(exc.value)
+    guardrail_information = request_data["metadata"]["standard_logging_guardrail_information"]
+    assert guardrail_information[0]["guardrail_provider"] == "straiker"
 
 
 @pytest.mark.asyncio
