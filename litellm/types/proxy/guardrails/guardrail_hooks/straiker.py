@@ -211,10 +211,6 @@ class StraikerCodingAgentConfig(BaseModel):
             "deployment without per-developer virtual keys needs it to tell developers apart."
         ),
     )
-    model_override: str | None = Field(
-        default=None,
-        description="Force the model reported on each event instead of the model the request named.",
-    )
     fail_open: bool = Field(
         default=True,
         description=(
@@ -393,20 +389,6 @@ class StraikerGuardrailConfigModelOptionalParams(BaseModel):
     coding_agent_user_name_header: str | None = Field(
         default="X-Straiker-User-Name",
         description="Request header to take developer identity from when a virtual key has no user.",
-    )
-    coding_agent_model_override: str | None = Field(
-        default=None,
-        description="Force the model reported on each coding-agent event.",
-    )
-    coding_agent_max_event_bytes: int | None = Field(
-        default=None,
-        gt=0,
-        description="Cap on one hook event; oversized tool output is truncated with a marker.",
-    )
-    coding_agent_dedup_ttl: int | None = Field(
-        default=None,
-        gt=0,
-        description="Seconds an emitted coding-agent event is remembered so a resent transcript is not rescored.",
     )
     app_attribution: StraikerAppAttribution | None = Field(
         default="default",

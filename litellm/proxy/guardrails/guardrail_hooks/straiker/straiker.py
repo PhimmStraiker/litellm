@@ -763,7 +763,7 @@ class StraikerGuardrail(CustomGuardrail):
         agent: StraikerCodingAgentKind,
     ) -> tuple[StraikerHookEvent, ...]:
         user_name = self._coding_user_name(config, request_data)
-        model = config.model_override or _as_optional_str(request_data.get("model"))
+        model = _as_optional_str(request_data.get("model"))
         if input_type == "request":
             parsed = coding_agent.parse_request(request_data, chatter_filter=config.chatter_filter)
             events = coding_agent.request_events(parsed, session_id, user_name, agent, model)

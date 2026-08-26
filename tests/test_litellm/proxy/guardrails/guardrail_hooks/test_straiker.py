@@ -2308,15 +2308,21 @@ async def test_events_carry_the_model_so_the_console_can_attribute_them():
     assert _posted_events(g)[0]["model"] == "claude-opus-4-8"
 
 
-@pytest.mark.asyncio
-async def test_model_override_wins_over_the_requested_model():
-    g = _make_coding_guardrail(model_override="claude-code")
+def test_the_config_surface_stays_small():
+    """Every option is one more thing an operator has to reason about, so the coding-agent
+    settings are limited to what actually changes behaviour: whether it is on, which
+    application it reports to, what it does on a verdict, and what it costs."""
+    fields = [f for f in StraikerGuardrailConfigModelOptionalParams.model_fields if f.startswith("coding_agent_")]
 
-    await g.apply_guardrail(
-        inputs={"texts": []}, request_data=_cc_request(_tool_result_messages()), input_type="request"
-    )
-
-    assert _posted_events(g)[0]["model"] == "claude-code"
+    assert set(fields) == {
+        "coding_agent_enabled",
+        "coding_agent_api_key",
+        "coding_agent_mode",
+        "coding_agent_latency",
+        "coding_agent_fail_open",
+        "coding_agent_chatter_filter",
+        "coding_agent_user_name_header",
+    }
 
 
 @pytest.mark.asyncio

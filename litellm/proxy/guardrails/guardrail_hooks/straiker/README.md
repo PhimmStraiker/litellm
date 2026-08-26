@@ -193,7 +193,10 @@ These flags are read per guardrail entry rather than per request, so a proxy ser
 - `coding_agent_fail_open` (default: `true`): Whether coding-agent traffic proceeds when scoring is unavailable
 - `coding_agent_chatter_filter` (default: `true`): Drops the agent's scaffolding calls
 - `coding_agent_user_name_header` (default: `X-Straiker-User-Name`): Header to take developer identity from
-- `coding_agent_model_override`, `coding_agent_max_event_bytes`, `coding_agent_dedup_ttl`: advanced tuning
+
+Everything else is fixed at a sensible default rather than exposed as a setting: events carry
+the model the request named, oversized tool output is truncated with a marker, and repeated
+events within a session are only scored once.
 
 ## What Straiker receives
 

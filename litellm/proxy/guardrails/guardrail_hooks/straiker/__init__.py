@@ -30,9 +30,6 @@ _CODING_AGENT_FIELDS = (
     "fail_open",
     "chatter_filter",
     "user_name_header",
-    "model_override",
-    "max_event_bytes",
-    "dedup_ttl",
 )
 
 
