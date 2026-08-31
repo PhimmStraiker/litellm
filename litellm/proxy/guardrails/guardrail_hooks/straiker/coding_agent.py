@@ -21,8 +21,7 @@ from typing import Final, Literal, cast
 from pydantic import BaseModel
 
 from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
-    STRAIKER_CODING_TOOL_HEADER,
-    STRAIKER_CURSOR_TOOL_HEADER,
+    STRAIKER_AGENT_TOOL_HEADERS,
     TRUNCATION_MARKER,
     StraikerHookEvent,
     StraikerHookEventName,
@@ -226,8 +225,7 @@ def detect_agent(
 
 
 def x_tool_for(agent: AgentKind) -> str:
-    """Codex has no backend routing value; callers must supply x_tool_override for it."""
-    return STRAIKER_CURSOR_TOOL_HEADER if agent == "cursor" else STRAIKER_CODING_TOOL_HEADER
+    return STRAIKER_AGENT_TOOL_HEADERS[agent]
 
 
 def _tool_names_by_id(messages: Sequence[object]) -> Mapping[str, str]:

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import get_args
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,7 +23,9 @@ from litellm.proxy.guardrails.guardrail_registry import (
     guardrail_initializer_registry,
 )
 from litellm.types.proxy.guardrails.guardrail_hooks.straiker import (
+    STRAIKER_AGENT_TOOL_HEADERS,
     StraikerCodingAgentConfig,
+    StraikerCodingAgentKind,
     StraikerGuardrailConfigModel,
     StraikerGuardrailConfigModelOptionalParams,
 )
@@ -2042,10 +2045,10 @@ async def test_cursor_tool_events_split_by_tool_class(tool_name, expected):
 
 
 @pytest.mark.asyncio
-async def test_codex_is_off_by_default_and_falls_through_to_the_webhook():
-    """Codex has no backend x-tool value, so it must not be mislabeled as claude-code."""
+async def test_codex_is_on_by_default_and_routes_under_its_own_x_tool():
+    """Codex traffic must be attributed to codex. Routing it as claude-code writes the
+    wrong actor_ref on every event the backend records for the session."""
     g = _make_coding_guardrail()
-    g.async_handler.post.return_value = _mock_response("NONE")
     request_data = {
         "model": "gpt-5",
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "fix the build"}]}],
@@ -2058,14 +2061,31 @@ async def test_codex_is_off_by_default_and_falls_through_to_the_webhook():
         inputs={"texts": ["fix the build"]}, request_data=request_data, input_type="request", logging_obj=_logging_obj()
     )
 
-    assert g.async_handler.post.call_args.args[0].endswith("/api/v1/detect/webhook")
+    assert g.async_handler.post.call_args.args[0].endswith("/api/v1/detect")
+    assert g.async_handler.post.call_args.kwargs["headers"]["x-tool"] == "codex"
+
+
+@pytest.mark.parametrize(
+    ("agent", "expected"),
+    [("claude_code", "claude-code"), ("cursor", "cursor"), ("codex", "codex")],
+)
+def test_every_agent_routes_under_its_own_x_tool(agent, expected):
+    """No agent may borrow another's routing value."""
+    assert coding_agent.x_tool_for(agent) == expected
+
+
+def test_x_tool_mapping_covers_every_agent_kind():
+    """A new agent kind must not silently inherit some other agent's header."""
+    kinds = set(get_args(StraikerCodingAgentKind))
+    assert set(STRAIKER_AGENT_TOOL_HEADERS) == kinds
+    assert len(set(STRAIKER_AGENT_TOOL_HEADERS.values())) == len(kinds)
 
 
 @pytest.mark.asyncio
-async def test_codex_responses_input_parses_when_explicitly_enabled():
+async def test_codex_responses_input_parses_without_an_override():
     """The Responses API carries a flat item list rather than messages; tool calls and
     their outputs are siblings of the user text."""
-    g = _make_coding_guardrail(agents=["claude_code", "codex"], x_tool_override="claude-code")
+    g = _make_coding_guardrail()
     request_data = {
         "model": "gpt-5",
         "input": [

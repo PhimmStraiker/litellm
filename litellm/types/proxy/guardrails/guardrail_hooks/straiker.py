@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -29,8 +31,13 @@ StraikerAppAttribution = Literal["default", "model", "key_alias", "team_alias"]
 
 STRAIKER_WEBHOOK_SCHEMA_VERSION: Final = "1"
 STRAIKER_DETECT_PATH: Final = "/api/v1/detect"
-STRAIKER_CODING_TOOL_HEADER: Final = "claude-code"
-STRAIKER_CURSOR_TOOL_HEADER: Final = "cursor"
+STRAIKER_AGENT_TOOL_HEADERS: Final[Mapping[StraikerCodingAgentKind, str]] = MappingProxyType(
+    {
+        "claude_code": "claude-code",
+        "cursor": "cursor",
+        "codex": "codex",
+    }
+)
 TRUNCATION_MARKER: Final = "…[truncated by Straiker gateway]"
 
 PROMPT_EVENTS: Final = frozenset({"UserPromptSubmit", "beforeSubmitPrompt"})
@@ -266,16 +273,18 @@ class StraikerCodingAgentConfig(BaseModel):
         ),
     )
     agents: list[StraikerCodingAgentKind] = Field(
-        default=["claude_code", "cursor"],
+        default=["claude_code", "cursor", "codex"],
         description=(
-            "Which coding agents to reconstruct events for. 'codex' is off by default: the "
-            "Straiker backend has no x-tool value for it, so enabling it requires x_tool_override "
-            "and mislabels the traffic until the backend adds one."
+            "Which coding agents to reconstruct events for. Each is routed under its own x-tool "
+            "value so the backend attributes the traffic to the agent that produced it."
         ),
     )
     x_tool_override: str | None = Field(
         default=None,
-        description="Force the x-tool routing header instead of deriving it from the detected agent.",
+        description=(
+            "Force the x-tool routing header instead of deriving it from the detected agent. "
+            "Only needed for a backend that routes an agent under a non-default value."
+        ),
     )
 
     @field_validator("detect_path")
